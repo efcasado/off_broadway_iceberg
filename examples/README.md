@@ -69,6 +69,10 @@ Failed batches: 0
 Elapsed: 2.105s
 ```
 
+Two processors handle batches at the same time, so batch lines can appear out of order. The
+`Reading` and `Snapshot` lines come from another process and can even appear after the first
+batch.
+
 ### How it works
 
 `QuackDB.Server.child_specs/1` starts DuckDB as a local process and a QuackDB pool connected
