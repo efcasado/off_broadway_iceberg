@@ -1,15 +1,16 @@
 services:
   # An Iceberg REST catalog with its warehouse on the local file system. DuckDB runs on
   # the host and writes data files under the paths the catalog hands out, so the
-  # warehouse is mounted at the same absolute path it has on the host. The catalog runs
-  # with umask 0000 so that DuckDB, as another user, can write to the directories it
-  # creates.
+  # warehouse is mounted at the same absolute path it has on the host.
   iceberg-rest:
     image: apache/iceberg-rest-fixture:latest@sha256:009f9f6897cc1e8fd6e8133c401c7a3e7c333c71293a621d06a71570ae989c29
-    entrypoint: ["sh", "-c", "umask 0000 && exec java -jar iceberg-rest-adapter.jar"]
     environment:
       CATALOG_WAREHOUSE: "file://${ICEBERG_WAREHOUSE:?set ICEBERG_WAREHOUSE to an absolute path}"
+      # The image puts this directory on the classpath, which is how its core-site.xml
+      # reaches Hadoop. It makes what the catalog creates writable by DuckDB's user.
+      LOG_CONFIG_DIR: /etc/iceberg-rest
     volumes:
       - "${ICEBERG_WAREHOUSE}:${ICEBERG_WAREHOUSE}"
+      - "./test/support/iceberg-rest:/etc/iceberg-rest:ro"
     ports:
       - "18181:8181"
