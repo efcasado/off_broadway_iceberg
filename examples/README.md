@@ -116,3 +116,81 @@ if the tree fails to start, for example when the catalog cannot be attached.
 - **The table does not exist.** The script prints DuckDB's error, which suggests similar
   names. To list the tables, attach the catalog in the DuckDB CLI and run
   `SELECT schema_name, table_name FROM duckdb_tables() WHERE database_name = 'pubdata'`.
+
+## PostgreSQL backfill
+
+[`postgres_backfill.exs`](postgres_backfill.exs) is the backfill this library is for: it
+reads the same `environment.earthquakes` table, validates every row, and upserts the valid
+rows into a PostgreSQL table. Besides what the first example needs, it needs a PostgreSQL
+server.
+
+It demonstrates:
+
+- Application logic in plain functions, `Earthquakes.validate/1` and `Earthquakes.store!/2`,
+  that a pipeline reading the same events from Pulsar could call unchanged.
+- One `INSERT` per batch, with each column passed as one array parameter.
+- Idempotent, version-aware upserts: running it again changes nothing.
+- Invalid rows recorded in a rejects table instead of failing their batch.
+
+### Running it
+
+Any PostgreSQL will do. The example was tested with PostgreSQL 18:
+
+```shell
+docker run --rm -d --name postgres -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:18
+DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres elixir examples/postgres_backfill.exs
+```
+
+The script creates two tables if they do not exist: `earthquakes`, keyed by `event_id`, and
+`earthquake_rejects`. The output looks like this; snapshot, order and timings vary:
+
+```text
+Reading pubdata.environment.earthquakes
+Snapshot: 5964070490105136742
+
+Batch 1: 5000 rows, 5000 written, 0 rejected
+Batch 0: 5000 rows, 5000 written, 0 rejected
+...
+
+Completed.
+Rows read: 188490
+Batches processed: 40
+Failed batches: 0
+Elapsed: 2.722s
+Rows in earthquakes: 188490
+Rows in earthquake_rejects: 0
+```
+
+Run it again and every batch reports `0 written`.
+
+### How it writes
+
+Each batch becomes one statement:
+
+```sql
+INSERT INTO earthquakes (event_id, event_time, ...)
+SELECT * FROM unnest($1::text[], $2::timestamptz[], ...)
+ON CONFLICT (event_id) DO UPDATE SET event_time = excluded.event_time, ...
+WHERE excluded.updated_at > earthquakes.updated_at
+```
+
+A row only replaces one with an older `updated_at`. Writing the same rows again changes
+nothing, and the order the batches arrive in does not matter. That makes the scan safe to
+replay after a failure, and safe to run alongside another pipeline that writes newer
+versions of the same rows, such as one reading Pulsar.
+
+Validation works on one row at a time, so each batch is turned into maps with
+`QuackDB.Columns.to_maps/1` first. A pipeline with no per-row logic can skip that and pass
+each column to the statement directly, with `QuackDB.Columns.get/3`. If it does not need
+Elixir at all, DuckDB's `postgres` extension can write to PostgreSQL without the rows passing
+through the BEAM.
+
+### Failures
+
+- A row that fails validation goes to `earthquake_rejects`, with the reason and the row as
+  JSON. Its batch still succeeds. The current table passes every check, so the rejects table
+  stays empty.
+- A batch that PostgreSQL fails to write is a failed message. The script reports it and exits
+  with status 1. Running it again is safe, and writes what is missing.
+- If PostgreSQL cannot be reached at startup, the script exits with status 1 before reading
+  anything.
