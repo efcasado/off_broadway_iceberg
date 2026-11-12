@@ -231,11 +231,14 @@ reconnects it.
 
 ## Examples
 
-[`examples/public_catalog.exs`](examples/public_catalog.exs) reads a table of a public Iceberg
-REST catalog end to end, with DuckDB managed by QuackDB and nothing else to set up:
+- [`examples/public_catalog.exs`](examples/public_catalog.exs) reads a table of a public
+  Iceberg REST catalog end to end, with DuckDB managed by QuackDB and nothing else to set up.
+- [`examples/postgres_backfill.exs`](examples/postgres_backfill.exs) backfills the same data
+  into PostgreSQL, with validation, a rejects table and idempotent, version-aware upserts.
 
 ```shell
 elixir examples/public_catalog.exs
+DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres elixir examples/postgres_backfill.exs
 ```
 
 See [`examples/README.md`](examples/README.md).
