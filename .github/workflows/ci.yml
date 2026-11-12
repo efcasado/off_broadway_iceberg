@@ -1,0 +1,150 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  MIX_ENV: test
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    if: "!contains(github.event.head_commit.message, '[skip tests]')"
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v7
+
+    - name: Install mise
+      uses: jdx/mise-action@v5.2.7
+      with:
+        experimental: true
+
+    - name: Cache mise tools
+      uses: actions/cache@v6
+      with:
+        path: |
+          ~/.local/share/mise
+          ~/.cache/mise
+        key: ${{ runner.os }}-mise-${{ hashFiles('mise.toml') }}
+        restore-keys: |
+          ${{ runner.os }}-mise-
+
+    - name: Install tools with mise
+      run: mise install
+
+    - name: Cache Mix dependencies
+      uses: actions/cache@v6
+      with:
+        path: |
+          deps
+          _build
+        key: ${{ runner.os }}-mix-${{ hashFiles('mise.toml') }}-${{ hashFiles('**/mix.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-mix-${{ hashFiles('mise.toml') }}-
+
+    - name: Cache plt files
+      uses: actions/cache@v6
+      with:
+        path: |
+          priv/plts
+        key: |
+          plt-${{ runner.os }}-${{ hashFiles('mise.toml') }}-${{ hashFiles('**/mix.lock') }}
+        restore-keys: |
+          plt-${{ runner.os }}-${{ hashFiles('mise.toml') }}-
+
+    - name: Get Mix dependencies
+      run: mix deps.get
+
+    - name: Check formatting
+      run: mix format --check-formatted
+
+    - name: Compile (warnings as errors)
+      run: mix compile --warnings-as-errors
+
+    - name: Check Credo
+      run: mix credo --strict
+
+    - name: Check Dialyzer
+      run: mix dialyzer --format github --format dialyxir
+
+    # Unit tests only: they need neither DuckDB nor Docker.
+    - name: Run tests with coverage
+      run: mix coveralls
+
+    - name: Publish Test Report
+      uses: dorny/test-reporter@v3.2.0
+      if: always()
+      with:
+        name: Test Results
+        path: test/reports/junit.xml
+        reporter: java-junit
+
+  integration:
+    name: Integration
+    runs-on: ubuntu-latest
+    if: "!contains(github.event.head_commit.message, '[skip tests]')"
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v7
+
+    - name: Install mise
+      uses: jdx/mise-action@v5.2.7
+      with:
+        experimental: true
+
+    - name: Cache mise tools
+      uses: actions/cache@v6
+      with:
+        path: |
+          ~/.local/share/mise
+          ~/.cache/mise
+        key: ${{ runner.os }}-mise-${{ hashFiles('mise.toml') }}
+        restore-keys: |
+          ${{ runner.os }}-mise-
+
+    - name: Install tools with mise
+      run: mise install
+
+    - name: Cache Mix dependencies
+      uses: actions/cache@v6
+      with:
+        path: |
+          deps
+          _build
+        key: ${{ runner.os }}-mix-${{ hashFiles('mise.toml') }}-${{ hashFiles('**/mix.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-mix-${{ hashFiles('mise.toml') }}-
+
+    # The DuckDB binary QuackDB manages, and the DuckDB extensions it installs. Both
+    # follow the QuackDB version in mix.lock.
+    - name: Cache DuckDB
+      uses: actions/cache@v6
+      with:
+        path: |
+          ~/.cache/quackdb
+          ~/.duckdb/extensions
+        key: ${{ runner.os }}-duckdb-${{ hashFiles('**/mix.lock') }}
+
+    - name: Get Mix dependencies
+      run: mix deps.get
+
+    - name: Run integration tests
+      run: mix test --only integration
+
+    - name: Publish Test Report
+      uses: dorny/test-reporter@v3.2.0
+      if: always()
+      with:
+        name: Integration Test Results
+        path: test/reports/junit.xml
+        reporter: java-junit
