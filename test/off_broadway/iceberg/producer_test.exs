@@ -281,6 +281,23 @@ defmodule OffBroadway.Iceberg.ProducerTest do
       assert log =~ "1 batches of #{inspect(table)} at snapshot 42 failed and will not be retried: [1]"
       refute_received {:messages, _messages}
     end
+
+    test "log failed batch indexes as numbers, even when they are printable characters" do
+      pool = start_pool(rows: rows(11))
+      %{consumer: consumer} = start_producer(pool, fetch_size: 1)
+
+      ManualConsumer.ask(consumer, 20)
+      messages = receive_messages(11)
+      {failed, successful} = Enum.split_with(messages, &(&1.metadata.batch_index in [7, 10]))
+
+      log =
+        capture_log(fn ->
+          ack(successful, Enum.map(failed, &Message.failed(&1, "boom")))
+          assert_receive {:telemetry, [:off_broadway_iceberg, :scan, :stop], %{failed_batches: 2}, _}
+        end)
+
+      assert log =~ "failed and will not be retried: [7, 10]"
+    end
   end
 
   describe "failures" do

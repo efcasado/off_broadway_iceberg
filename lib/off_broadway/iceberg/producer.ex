@@ -326,7 +326,7 @@ defmodule OffBroadway.Iceberg.Producer do
 
       Logger.warning(
         "#{length(failed)} batches of #{inspect(state.table)} at snapshot #{inspect(state.snapshot_id)} " <>
-          "failed and will not be retried: #{inspect(indexes)}"
+          "failed and will not be retried: #{inspect(indexes, charlists: :as_lists)}"
       )
     end
 
