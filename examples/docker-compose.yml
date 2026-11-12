@@ -1,0 +1,21 @@
+# PostgreSQL for examples/postgres_backfill.exs, which connects to it by default.
+#
+#   docker compose -f examples/docker-compose.yml up --detach --wait
+#   elixir examples/postgres_backfill.exs
+#   docker compose -f examples/docker-compose.yml down --volumes
+#
+# It listens on port 55432, so that it does not clash with a PostgreSQL already on 5432.
+name: off_broadway_iceberg_examples
+
+services:
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "55432:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 1s
+      timeout: 5s
+      retries: 30

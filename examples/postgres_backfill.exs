@@ -9,8 +9,11 @@
 # overwritten by a newer version of itself.
 #
 # Usage, from the repository root:
-#   docker run --rm -d --name postgres -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:18
-#   DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres elixir examples/postgres_backfill.exs
+#   docker compose -f examples/docker-compose.yml up --detach --wait
+#   elixir examples/postgres_backfill.exs
+#
+# It connects to the PostgreSQL in examples/docker-compose.yml. Set DATABASE_URL to use
+# another one.
 #
 # The script exits on its own: with status 0 once every batch has been written, and with
 # status 1 if the scan failed or any batch did. See examples/README.md.
@@ -296,11 +299,8 @@ defmodule PostgresBackfill do
   defp format(reason), do: Exception.format_exit(reason)
 end
 
-case System.get_env("DATABASE_URL") do
-  nil ->
-    IO.puts(:stderr, "Set DATABASE_URL, for example postgres://postgres:postgres@localhost:5432/postgres")
-    System.halt(1)
-
-  url ->
-    url |> PostgresBackfill.run() |> System.halt()
-end
+# The PostgreSQL of examples/docker-compose.yml, unless DATABASE_URL says otherwise.
+"DATABASE_URL"
+|> System.get_env("postgres://postgres:postgres@localhost:55432/postgres")
+|> PostgresBackfill.run()
+|> System.halt()
