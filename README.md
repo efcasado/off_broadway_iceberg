@@ -175,6 +175,16 @@ the snapshot again. It emits telemetry along the way:
   `:batches`, `:rows` and `:failed_batches`.
 - `[:off_broadway_iceberg, :scan, :exception]` when the scan fails.
 
+A `:stop` event with `failed_batches: 0` means every batch was processed successfully.
+With `failed_batches` above 0, the whole snapshot was read, but that many batches failed
+downstream. A scan that could not read the snapshot emits `:exception` instead, never
+`:stop`.
+
+Attach telemetry handlers before starting the pipeline, since a scan that fails early
+emits `:exception` right away. The events are the only record of the outcome: the producer
+stays idle whether the scan completed or failed. If you need the outcome later, for
+example to resume a job, persist it yourself.
+
 Broadway has no way for a producer to stop its own pipeline. To stop it when the scan
 completes, handle the `:stop` event and call `Broadway.stop/1` from another process.
 
