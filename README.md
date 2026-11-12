@@ -103,6 +103,32 @@ catalogs that need credentials and for object storage secrets.
 The producer requires `producer: [concurrency: 1]`, since every producer stage would scan
 the whole snapshot. Scale out with the processors instead.
 
+### One DuckDB per pipeline
+
+Give each pipeline its own DuckDB server and QuackDB pool, under one `:rest_for_one`
+supervisor, as above. The pipeline then owns that DuckDB instance's extensions and attached
+catalogs, which no other code changes. DuckDB's memory and threads are freed when the
+pipeline stops, and a failing DuckDB only takes down its own pipeline.
+
+DuckDB uses every core and up to 80% of the machine's memory by default. When several
+pipelines run on one machine, give each its share:
+
+```elixir
+server: [name: MyApp.DuckDB, duckdb: :managed, settings: [threads: 4, memory_limit: "4GB"]]
+```
+
+Run the setup in the pipeline's `start_link`, before `Broadway.start_link/2`, as above. It
+runs once, it fails the startup with the actual error, and it runs again whenever DuckDB
+restarts, because the supervisor then restarts the pipeline too. Two other places look
+natural but are not reliable:
+
+- The pool's `:after_connect` option runs on every connection, at the same time. DuckDB
+  rejects all but one of the concurrent `ATTACH IF NOT EXISTS` with "already exists", and
+  DBConnection still hands out a connection whose setup failed. Scans then fail with errors
+  that do not name the cause.
+- A `Task` started before the pipeline does not wait for the setup to finish, so the scan
+  can start before the catalog is attached.
+
 ### Options
 
 - `:connection` (required) - The QuackDB pool: the pid or registered name of a pool started
