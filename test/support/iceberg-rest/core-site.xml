@@ -1,0 +1,13 @@
+<?xml version="1.0"?>
+<!--
+  Hadoop configuration for the Iceberg REST catalog in docker-compose.yml. Hadoop
+  creates directories and files with its own umask, not the process's. With 000, the
+  directories the catalog creates in the warehouse are writable by DuckDB, which runs
+  on the host as another user.
+-->
+<configuration>
+  <property>
+    <name>fs.permissions.umask-mode</name>
+    <value>000</value>
+  </property>
+</configuration>
