@@ -203,6 +203,17 @@ When the pipeline shuts down mid-scan, the producer stops its worker. The connec
 worker held is disconnected, which cancels the query on the DuckDB server, and the pool
 reconnects it.
 
+## Examples
+
+[`examples/public_catalog.exs`](examples/public_catalog.exs) reads a table of a public Iceberg
+REST catalog end to end, with DuckDB managed by QuackDB and nothing else to set up:
+
+```shell
+elixir examples/public_catalog.exs
+```
+
+See [`examples/README.md`](examples/README.md).
+
 ## Development
 
 The toolchain is pinned in `mise.toml`:
