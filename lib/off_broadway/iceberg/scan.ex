@@ -21,7 +21,8 @@ defmodule OffBroadway.Iceberg.Scan do
   """
   @spec start_link(pid(), reference(), keyword()) :: pid()
   def start_link(producer, ref, opts) do
-    spawn_link(fn -> run(producer, ref, opts) end)
+    {:ok, scan} = Task.start_link(fn -> run(producer, ref, opts) end)
+    scan
   end
 
   @doc """

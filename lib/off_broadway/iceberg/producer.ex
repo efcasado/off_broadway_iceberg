@@ -197,6 +197,16 @@ defmodule OffBroadway.Iceberg.Producer do
   `:name` is the Broadway pipeline name, or `nil` outside Broadway. Durations are in
   `:native` time units.
 
+  A `:stop` event with `failed_batches: 0` means every emitted batch was processed
+  successfully. With `failed_batches` above 0, the scan read the whole snapshot, but that
+  many batches failed downstream. A scan that could not read the snapshot emits
+  `:exception` instead, never `:stop`.
+
+  Attach handlers before starting the pipeline. The scan starts with the producer, and
+  one that fails early emits `:exception` right away. The events are the only record of
+  a scan's outcome: the producer stays idle whether the scan completed or failed. If you
+  need the outcome later, persist it yourself.
+
   QuackDB emits its own `[:quackdb, :query, ...]` and `[:quackdb, :fetch, ...]` events.
   """
   def start_link(opts) do
