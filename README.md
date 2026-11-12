@@ -238,7 +238,9 @@ reconnects it.
 
 ```shell
 elixir examples/public_catalog.exs
-DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres elixir examples/postgres_backfill.exs
+
+docker compose -f examples/docker-compose.yml up --detach --wait
+elixir examples/postgres_backfill.exs
 ```
 
 See [`examples/README.md`](examples/README.md).

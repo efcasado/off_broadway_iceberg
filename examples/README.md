@@ -134,12 +134,17 @@ It demonstrates:
 
 ### Running it
 
-Any PostgreSQL will do. The example was tested with PostgreSQL 18:
+[`docker-compose.yml`](docker-compose.yml) runs PostgreSQL 18 on port 55432, which the
+script connects to by default:
 
 ```shell
-docker run --rm -d --name postgres -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:18
-DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres elixir examples/postgres_backfill.exs
+docker compose -f examples/docker-compose.yml up --detach --wait
+elixir examples/postgres_backfill.exs
+docker compose -f examples/docker-compose.yml down --volumes
 ```
+
+Any other PostgreSQL works too: point `DATABASE_URL` at it, for example
+`DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres`.
 
 The script creates two tables if they do not exist: `earthquakes`, keyed by `event_id`, and
 `earthquake_rejects`. The output looks like this; snapshot, order and timings vary:
@@ -192,5 +197,5 @@ through the BEAM.
   stays empty.
 - A batch that PostgreSQL fails to write is a failed message. The script reports it and exits
   with status 1. Running it again is safe, and writes what is missing.
-- If PostgreSQL cannot be reached at startup, the script exits with status 1 before reading
-  anything.
+- If PostgreSQL cannot be reached at startup, for example because the Compose service is not
+  running, the script exits with status 1 before reading anything.
