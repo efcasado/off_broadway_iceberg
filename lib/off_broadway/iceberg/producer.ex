@@ -99,7 +99,7 @@ defmodule OffBroadway.Iceberg.Producer do
       Shares the scan between the producers of this pipeline on every connected node.
       `true`, or `[slice_rows: rows]` to set how many rows a slice holds at least (default
       `#{@slice_rows}`): small data files are grouped into slices of that many rows, and
-      larger files make a slice each. See "Distributed scans" below. Requires an integer
+      files are never split. See "Distributed scans" below. Requires an integer
       or `{:as_of, datetime}` `:snapshot_id`.
       """
     ],
@@ -316,8 +316,8 @@ defmodule OffBroadway.Iceberg.Producer do
 
   Each member plans the scan the same way. It resolves the snapshot and lists its data
   files from the table's manifests, through `iceberg_files`, in path order. Consecutive
-  small files make a slice once they hold `:slice_rows` rows between them, and a larger
-  file makes a slice of its own. Files are never split. A slice is read with
+  files make a slice once they hold `:slice_rows` rows between them. Files are never
+  split, even when one exceeds that target. A slice is read with
   `SELECT * FROM table AT (VERSION => snapshot_id) WHERE filename IN (...)`, so DuckDB
   opens only those files, and still applies the table's delete files. `:columns` and
   `:where` then select from the rows of the slice, as above.
@@ -511,13 +511,8 @@ defmodule OffBroadway.Iceberg.Producer do
   once, wherever it was read, and those of `:exception` the batches this producer
   emitted. See "What `:stop` means" above.
 
-  A `:stop` event with `failed_batches: 0` means every row was processed successfully.
-  With `failed_batches` above 0, the scan read the whole snapshot, but that many batches
-  failed downstream. A scan that could not read the snapshot emits `:exception` instead,
-  never `:stop`. `:local_failed_batches` counts the batches this producer emitted that
-  failed. Without `:distribute`, it always equals `failed_batches`. In a distributed scan,
-  it also counts failures in copies of slices that other members processed without
-  failures. See "What `:stop` means" above.
+  See "Completion, failure and restarts" and "What `:stop` means" above for how to
+  interpret these outcomes, including failures in duplicate copies of a slice.
 
   Attach handlers before starting the pipeline. The scan starts with the producer, and
   one that fails early emits `:exception` right away. The events are the only record of

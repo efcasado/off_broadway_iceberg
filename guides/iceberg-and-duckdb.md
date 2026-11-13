@@ -305,10 +305,10 @@ WHERE content = 0 -- data files; delete files are 1 and 2
 ORDER BY file_path;
 ```
 
-Consecutive small files make one slice once they hold `:slice_rows` rows between them,
-a million by default, and a larger file makes a slice of its own. Files are never split.
+Consecutive files make one slice once they hold `:slice_rows` rows between them, a
+million by default. Files are never split, even when one exceeds that target.
 With 8 data files of 500,000 rows each, the scan has 4 slices of 2 files, and with a
-`:fetch_size` of 10,000, each slice makes 100 messages. A table stored in one huge file
+`:fetch_size` of 10,000, each slice makes at least 100 messages. A table stored in one huge file
 makes one slice, which only one producer can read.
 
 Every producer plans on its own. Since they all plan the same snapshot the same way, they
@@ -430,9 +430,6 @@ Every object is created with a
 nodes can record the same slice at the same time, and none overwrites another. A later run
 of the job loads the recorded slices, and reads only the others.
 
-Checkpoints let a restart skip finished work. They do not make processing exactly-once: a
-producer can process every batch of a slice and stop before recording it.
-
 Read more: "Checkpoints" in `OffBroadway.Iceberg.Producer`, and
 `OffBroadway.Iceberg.Checkpoint.GCS` for the bucket layout, permissions and
 authentication.
@@ -481,11 +478,6 @@ Between 1003 and 1004, a new file appeared, but no row is new: reading "the file
 commit did, in the `operation` of its snapshot: `append`, `replace`, `overwrite` or
 `delete`. Telling new rows apart starts there, and the library does not do it yet. To
 process data committed later, scan a later snapshot, with writes that are idempotent.
-
-Idempotent writes are a requirement throughout: a pipeline started again after a failure
-reads the snapshot again, unless it is checkpointed, a slice can be read twice, and a
-checkpoint can miss a slice that was processed. Key writes by the snapshot and the row's
-own key, so a replay is harmless.
 
 Read more: the spec's [snapshots](https://iceberg.apache.org/spec/#snapshots), whose
 summary records the operation, and [sequence numbers](https://iceberg.apache.org/spec/#sequence-numbers).
