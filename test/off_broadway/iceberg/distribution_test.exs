@@ -5,6 +5,7 @@ defmodule OffBroadway.Iceberg.DistributionTest do
   alias OffBroadway.Iceberg.Producer
   alias OffBroadway.Iceberg.Test.FakeConnection
   alias OffBroadway.Iceberg.Test.ManualConsumer
+  alias OffBroadway.Iceberg.Test.Pipeline
   alias OffBroadway.Iceberg.Test.Telemetry
 
   # DBConnection logs the disconnects that cancelled scans cause.
@@ -94,6 +95,50 @@ defmodule OffBroadway.Iceberg.DistributionTest do
   end
 
   describe "a distributed scan" do
+    test "is not reported complete while this producer's messages are still being processed" do
+      pool = start_pool(rows: rows(@rows))
+      table = unique_table()
+      name = :"pipeline_#{System.unique_integer([:positive])}"
+      Telemetry.attach_scan(table)
+      test = self()
+
+      # The only processor holds the first message until told to continue.
+      handler = fn message ->
+        if message.metadata.batch_index == 0 do
+          send(test, {:blocked, self()})
+
+          receive do
+            :continue -> :ok
+          end
+        end
+
+        message
+      end
+
+      producer = [
+        connection: pool,
+        table: table,
+        snapshot_id: 42,
+        fetch_size: 5,
+        distribute: [key: "id", slices: @slices]
+      ]
+
+      start_supervised!({Pipeline, name: name, handler: handler, producer: producer})
+      assert_receive {:blocked, processor}
+
+      # As when another member finishes every slice, this one's included.
+      [stage] = Broadway.producer_names(name)
+      group = :sys.get_state(stage).state.module_state.group
+      done = Map.new(0..(@slices - 1), &{&1, {0, 2, 10}})
+      send(stage, {Distribution, group, {:done, done}})
+
+      refute_receive {:telemetry, [:off_broadway_iceberg, :scan, :stop], _, _}, 200
+
+      send(processor, :continue)
+
+      assert_receive {:telemetry, [:off_broadway_iceberg, :scan, :stop], %{rows: @rows, batches: @batches}, _}
+    end
+
     test "is shared by its producers, which all report the whole scan" do
       pool = start_pool(rows: rows(@rows), pool_size: 4)
       table = unique_table()
