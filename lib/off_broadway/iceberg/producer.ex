@@ -243,7 +243,11 @@ defmodule OffBroadway.Iceberg.Producer do
 
   A member that finishes a slice tells the others, and every member tells those that
   join which slices are finished. Nothing is stored anywhere else: if every member stops
-  at once, for example in a full redeploy, the members that start next scan again.
+  at once, for example in a full redeploy, the members that start next scan again. With
+  an integer or `{:as_of, datetime}` `:snapshot_id`, they read the same rows again, so
+  idempotent writes make that harmless, if wasteful. For a backfill, record the snapshot
+  and its outcome in your application, and only start the pipeline while the backfill is
+  not complete.
 
   ### What `:stop` means
 
@@ -254,9 +258,15 @@ defmodule OffBroadway.Iceberg.Producer do
 
   A member emits `:stop` once it knows that every slice is finished and every batch it
   emitted itself has been acknowledged. So `:stop` means that every row of the snapshot
-  was processed at least once, by this member or by one it heard from. Its counts cover
-  each slice once. A member that joins after the scan finished emits `:stop` without
-  reading anything.
+  was processed at least once, by this member or by one it heard from. A member that
+  joins after the scan finished emits `:stop` without reading anything.
+
+  The `:batches`, `:rows` and `:failed_batches` of `:stop` count each slice once, from
+  the copy of it with the fewest failed batches. So `failed_batches: 0` means that every
+  slice was processed without failures by some member: every row landed. Failures in
+  other copies of a slice do not count there. `:local_failed_batches` counts every batch
+  this member emitted that failed, in any copy, so a failure anywhere shows up in the
+  `:stop` of the member that saw it, as well as in its logs.
 
   `:stop` does not mean that each row was processed exactly once, or that other members
   are done. A slice can be processed more than once:
@@ -287,8 +297,8 @@ defmodule OffBroadway.Iceberg.Producer do
   - `[:off_broadway_iceberg, :scan, :start]` - The snapshot is resolved and the scan
     begins. Measurements: `:system_time`. Metadata: `:name`, `:table`, `:snapshot_id`.
   - `[:off_broadway_iceberg, :scan, :stop]` - Every batch has been emitted and
-    acknowledged. Measurements: `:duration`, `:batches`, `:rows`, `:failed_batches`.
-    Metadata: `:name`, `:table`, `:snapshot_id`.
+    acknowledged. Measurements: `:duration`, `:batches`, `:rows`, `:failed_batches`,
+    `:local_failed_batches`. Metadata: `:name`, `:table`, `:snapshot_id`.
   - `[:off_broadway_iceberg, :scan, :exception]` - The scan failed. Measurements:
     `:duration`, `:batches`, `:rows`. Metadata: `:name`, `:table`, `:snapshot_id`
     (`nil` if the scan failed before resolving it), `:kind` and `:reason`.
@@ -298,10 +308,13 @@ defmodule OffBroadway.Iceberg.Producer do
   once, wherever it was read, and those of `:exception` the batches this producer
   emitted. See "What `:stop` means" above.
 
-  A `:stop` event with `failed_batches: 0` means every emitted batch was processed
-  successfully. With `failed_batches` above 0, the scan read the whole snapshot, but that
-  many batches failed downstream. A scan that could not read the snapshot emits
-  `:exception` instead, never `:stop`.
+  A `:stop` event with `failed_batches: 0` means every row was processed successfully.
+  With `failed_batches` above 0, the scan read the whole snapshot, but that many batches
+  failed downstream. A scan that could not read the snapshot emits `:exception` instead,
+  never `:stop`. `:local_failed_batches` counts the batches this producer emitted that
+  failed. Without `:distribute`, it always equals `failed_batches`. In a distributed scan,
+  it also counts failures in copies of slices that other members processed without
+  failures. See "What `:stop` means" above.
 
   Attach handlers before starting the pipeline. The scan starts with the producer, and
   one that fails early emits `:exception` right away. The events are the only record of
@@ -359,8 +372,11 @@ defmodule OffBroadway.Iceberg.Producer do
       # reference their messages are acknowledged with. The scan is not complete while
       # there are any, even when other members finished every slice.
       reads: %{},
+      # This producer's own counts, of every slice it read, whichever copy of a slice
+      # counts for the scan.
       emitted: 0,
       rows: 0,
+      failed: 0,
       # A scan without :distribute is a single slice that only this producer reads. A
       # distributed one has as many slices as its plan, and joins its group once planned.
       distributed?: distribute != nil,
@@ -450,7 +466,7 @@ defmodule OffBroadway.Iceberg.Producer do
     end
 
     read = %{read | acked: read.acked + length(successful), failed: read.failed + length(failed)}
-    state = %{state | reads: Map.put(state.reads, ref, read)}
+    state = %{state | reads: Map.put(state.reads, ref, read), failed: state.failed + length(failed)}
 
     {:noreply, [], state |> finish_read(ref) |> next_slice() |> maybe_complete()}
   end
@@ -707,7 +723,13 @@ defmodule OffBroadway.Iceberg.Producer do
 
     :telemetry.execute(
       [:off_broadway_iceberg, :scan, :stop],
-      %{duration: duration(state), batches: batches, rows: rows, failed_batches: failed},
+      %{
+        duration: duration(state),
+        batches: batches,
+        rows: rows,
+        failed_batches: failed,
+        local_failed_batches: state.failed
+      },
       event_metadata(state)
     )
 
