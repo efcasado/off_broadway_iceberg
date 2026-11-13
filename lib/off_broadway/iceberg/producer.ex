@@ -334,7 +334,8 @@ defmodule OffBroadway.Iceberg.Producer do
       # The worker reading a slice, if any: %{pid, ref, slice}.
       scan: nil,
       # Slices this producer has read whose batches are not all acknowledged yet, by the
-      # reference their messages are acknowledged with.
+      # reference their messages are acknowledged with. The scan is not complete while
+      # there are any, even when other members finished every slice.
       reads: %{},
       emitted: 0,
       rows: 0,
@@ -572,7 +573,7 @@ defmodule OffBroadway.Iceberg.Producer do
     snapshot_id = if is_integer(state.snapshot_id), do: state.snapshot_id, else: state.scan_opts[:snapshot_id]
 
     opts = Keyword.merge(state.scan_opts, snapshot_id: snapshot_id, slice: filter)
-    read = %{slice: slice, emitted: 0, acked: 0, failed: 0, rows: 0, exhausted?: false}
+    read = %{slice: slice, emitted: 0, acked: 0, failed: 0, rows: 0, exhausted?: false, dropped?: false}
 
     request_batches(%{
       state
@@ -606,9 +607,13 @@ defmodule OffBroadway.Iceberg.Producer do
     state
   end
 
-  # A slice is finished once it has been read to the end and every batch acknowledged.
+  # A slice is finished once it has been read to the end and every batch acknowledged. A
+  # read dropped because another member finished its slice only waits for its batches.
   defp finish_read(state, ref) do
     case Map.fetch!(state.reads, ref) do
+      %{dropped?: true, emitted: emitted, acked: acked, failed: failed} when acked + failed == emitted ->
+        %{state | reads: Map.delete(state.reads, ref)}
+
       %{exhausted?: true, emitted: emitted, acked: acked, failed: failed} = read when acked + failed == emitted ->
         finished = %{read.slice => {read.failed, read.emitted, read.rows}}
         if state.group, do: Distribution.announce(state.members, state.group, finished)
@@ -622,8 +627,9 @@ defmodule OffBroadway.Iceberg.Producer do
 
   # Another member finished the slice this producer is reading, so stop reading it. Its
   # emitted batches are still processed and acknowledged.
-  defp drop_finished_slice(%{scan: %{slice: slice}} = state) when is_map_key(state.done, slice) do
-    stop_scan(state)
+  defp drop_finished_slice(%{scan: %{slice: slice, ref: ref}} = state) when is_map_key(state.done, slice) do
+    state = stop_scan(state)
+    finish_read(%{state | reads: Map.update!(state.reads, ref, &%{&1 | dropped?: true})}, ref)
   end
 
   defp drop_finished_slice(state), do: state
@@ -635,7 +641,8 @@ defmodule OffBroadway.Iceberg.Producer do
     %{state | scan: nil, requested: 0}
   end
 
-  defp maybe_complete(%{status: :running, slices: slices, done: done} = state) when map_size(done) == slices do
+  defp maybe_complete(%{status: :running, slices: slices, done: done, reads: reads} = state)
+       when map_size(done) == slices and map_size(reads) == 0 do
     {failed, batches, rows} =
       Enum.reduce(Map.values(done), {0, 0, 0}, fn {f, b, r}, {failed, batches, rows} ->
         {failed + f, batches + b, rows + r}
