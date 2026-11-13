@@ -275,7 +275,9 @@ defmodule OffBroadway.Iceberg.ProducerTest do
       log =
         capture_log(fn ->
           ack([first], [Message.failed(second, "boom")])
-          assert_receive {:telemetry, [:off_broadway_iceberg, :scan, :stop], %{failed_batches: 1, batches: 2}, _}
+
+          assert_receive {:telemetry, [:off_broadway_iceberg, :scan, :stop],
+                          %{failed_batches: 1, local_failed_batches: 1, batches: 2}, _}
         end)
 
       assert log =~ "1 batches of #{inspect(table)} at snapshot 42 failed and will not be retried: [1]"

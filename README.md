@@ -160,7 +160,10 @@ producer can read.
 
 Once every slice is finished, every producer emits `:stop`: every row was processed at
 least once, by this producer or by one it heard from, and every batch this producer
-emitted was acknowledged. Nothing is stored outside the running nodes, which comes with
+emitted was acknowledged. `failed_batches: 0` means every slice was processed without
+failures by some producer, so every row landed. A slice processed twice can have failed in
+one copy only: such failures count in the `:local_failed_batches` of the producer that saw
+them, and in its logs. Nothing is stored outside the running nodes, which comes with
 trade-offs:
 
 - The nodes must be connected to each other. A producer only sees the producers on nodes
@@ -169,7 +172,10 @@ trade-offs:
   every producer reads the same snapshot.
 - A slice can be processed more than once while producers come and go, or when nodes
   cannot reach each other. Writes must be idempotent.
-- If every node restarts at once, the scan starts over.
+- If every node restarts at once, the scan starts over. With an explicit `:snapshot_id` or
+  `{:as_of, datetime}`, it reads the same rows again, so idempotent writes make that
+  harmless. For backfills, record the snapshot and the outcome in your application, and
+  only start the pipeline while the backfill is not complete.
 
 See "Distributed scans" in `OffBroadway.Iceberg.Producer` for what `:stop` guarantees
 exactly.
@@ -246,13 +252,14 @@ the snapshot again. It emits telemetry along the way:
 
 - `[:off_broadway_iceberg, :scan, :start]` once the snapshot is resolved.
 - `[:off_broadway_iceberg, :scan, :stop]` when the scan is complete, with the number of
-  `:batches`, `:rows` and `:failed_batches`.
+  `:batches`, `:rows`, `:failed_batches` and `:local_failed_batches`.
 - `[:off_broadway_iceberg, :scan, :exception]` when the scan fails.
 
 A `:stop` event with `failed_batches: 0` means every batch was processed successfully.
 With `failed_batches` above 0, the whole snapshot was read, but that many batches failed
 downstream. A scan that could not read the snapshot emits `:exception` instead, never
-`:stop`.
+`:stop`. `:local_failed_batches` counts the batches this producer emitted that failed,
+which is the same number unless the scan is distributed (see below).
 
 Attach telemetry handlers before starting the pipeline, since a scan that fails early
 emits `:exception` right away. The events are the only record of the outcome: the producer

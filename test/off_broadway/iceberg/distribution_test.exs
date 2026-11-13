@@ -154,6 +154,90 @@ defmodule OffBroadway.Iceberg.DistributionTest do
     end
   end
 
+  describe "failed batches" do
+    test "of a slice another member finished count as this producer's own, not the scan's" do
+      pool = start_pool(files: @files)
+      table = unique_table()
+      name = :"pipeline_#{System.unique_integer([:positive])}"
+      Telemetry.attach_scan(table)
+      test = self()
+
+      # The only processor holds the first message, then fails it.
+      handler = fn message ->
+        if message.metadata.batch_index == 0 do
+          send(test, {:blocked, self()})
+
+          receive do
+            :continue -> Broadway.Message.failed(message, "boom")
+          end
+        else
+          message
+        end
+      end
+
+      producer = [connection: pool, table: table, snapshot_id: 42, fetch_size: 5, distribute: [slice_rows: 10]]
+      start_supervised!({Pipeline, name: name, handler: handler, producer: producer})
+      assert_receive {:blocked, processor}
+
+      # Another member finished every slice without failures, this one's included.
+      [stage] = Broadway.producer_names(name)
+      group = :sys.get_state(stage).state.module_state.group
+      send(stage, {Distribution, group, {:done, Map.new(0..(@slices - 1), &{&1, {0, 2, 10}})}})
+      send(processor, :continue)
+
+      assert_receive {:telemetry, [:off_broadway_iceberg, :scan, :stop], measurements, _}
+      assert %{failed_batches: 0, local_failed_batches: 1, rows: @rows} = measurements
+    end
+
+    test "of a copy of a slice that lost to a copy without failures count as this producer's own" do
+      pool = start_pool(files: @files)
+      table = unique_table()
+      Telemetry.attach_scan(table)
+
+      # Read every slice, without acknowledging anything yet.
+      producer =
+        start_supervised!(
+          {Producer, connection: pool, table: table, snapshot_id: 42, fetch_size: 5, distribute: [slice_rows: 10]}
+        )
+
+      {:ok, consumer} = ManualConsumer.start_link(producer, tag: :a)
+      ManualConsumer.ask(consumer, 1_000)
+      messages = received_all(:a, @batches)
+
+      # Another member processed slice 0 without failures.
+      group = :sys.get_state(producer).state.group
+      send(producer, {Distribution, group, {:done, %{0 => {0, 2, 10}}}})
+
+      # This producer's copy of slice 0 has a failed batch.
+      {[failing], successful} = Enum.split_with(messages, &(&1.metadata.slice == 0 and &1.metadata.batch_index == 0))
+      Broadway.Acknowledger.ack_messages(successful, [Broadway.Message.failed(failing, "boom")])
+
+      assert_receive {:telemetry, [:off_broadway_iceberg, :scan, :stop], measurements, _}
+      assert %{failed_batches: 0, local_failed_batches: 1, rows: @rows, batches: @batches} = measurements
+    end
+
+    test "of the only copy of a slice count as the scan's too" do
+      pool = start_pool(files: @files)
+      table = unique_table()
+      Telemetry.attach_scan(table)
+
+      producer =
+        start_supervised!(
+          {Producer, connection: pool, table: table, snapshot_id: 42, fetch_size: 5, distribute: [slice_rows: 10]}
+        )
+
+      {:ok, consumer} = ManualConsumer.start_link(producer, tag: :a)
+      ManualConsumer.ask(consumer, 1_000)
+      messages = received_all(:a, @batches)
+
+      {[failing], successful} = Enum.split_with(messages, &(&1.metadata.slice == 3 and &1.metadata.batch_index == 1))
+      Broadway.Acknowledger.ack_messages(successful, [Broadway.Message.failed(failing, "boom")])
+
+      assert_receive {:telemetry, [:off_broadway_iceberg, :scan, :stop], measurements, _}
+      assert %{failed_batches: 1, local_failed_batches: 1} = measurements
+    end
+  end
+
   describe "a distributed scan" do
     test "is not reported complete while this producer's messages are still being processed" do
       pool = start_pool(files: @files)
@@ -303,6 +387,15 @@ defmodule OffBroadway.Iceberg.DistributionTest do
     after
       0 -> messages
     end
+  end
+
+  # Waits for `count` messages from the consumer tagged `id`.
+  defp received_all(id, count, messages \\ [])
+  defp received_all(_id, count, messages) when length(messages) >= count, do: messages
+
+  defp received_all(id, count, messages) do
+    assert_receive {:messages, ^id, more}, 5_000
+    received_all(id, count, messages ++ more)
   end
 
   defp flush(messages \\ []) do
