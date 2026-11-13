@@ -20,7 +20,49 @@ defmodule OffBroadwayIceberg.MixProject do
       docs: [
         main: "OffBroadway.Iceberg.Producer",
         extras: ["README.md", "guides/iceberg-and-duckdb.md"],
-        groups_for_extras: [Guides: ~r"guides/"]
+        groups_for_extras: [Guides: ~r"guides/"],
+        before_closing_body_tag: %{
+          html: """
+          <script defer src="https://cdn.jsdelivr.net/npm/mermaid@10.9.3/dist/mermaid.min.js"></script>
+          <script>
+            (() => {
+              let sequence = 0;
+
+              window.addEventListener("exdoc:loaded", () => {
+                if (!window.mermaid) return;
+
+                mermaid.initialize({
+                  startOnLoad: false,
+                  theme: document.body.classList.contains("dark") ? "dark" : "default"
+                });
+
+                for (const code of document.querySelectorAll("pre code.mermaid")) {
+                  const pre = code.parentElement;
+                  const container = document.createElement("div");
+                  container.className = "iceberg-mermaid";
+                  container.style.maxWidth = "100%";
+                  const id = "iceberg-mermaid-" + sequence++;
+
+                  mermaid.render(id, code.textContent).then(({svg, bindFunctions}) => {
+                    if (!pre.isConnected) return;
+                    container.innerHTML = svg;
+                    const renderedSvg = container.querySelector("svg");
+                    if (renderedSvg) {
+                      renderedSvg.style.maxWidth = "100%";
+                      renderedSvg.style.height = "auto";
+                    }
+                    bindFunctions?.(container);
+                    pre.replaceWith(container);
+                  }).catch(error => {
+                    console.warn("Could not render Mermaid diagram:", error);
+                  });
+                }
+              });
+            })();
+          </script>
+          """,
+          epub: ""
+        }
       ]
     ]
   end
