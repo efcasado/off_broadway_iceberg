@@ -347,6 +347,114 @@ defmodule OffBroadway.Iceberg.Integration.ProducerTest do
     end
   end
 
+  describe "selecting columns and rows" do
+    test "reads only the columns and rows selected, with deletes applied", %{schema: schema} do
+      table = Iceberg.create_table!(@pool, schema)
+      for file <- 0..3, do: Iceberg.insert!(@pool, table, (file * 2_500)..(file * 2_500 + 2_499))
+      QuackDB.query!(@pool, "DELETE FROM #{table} WHERE id % 7 = 0")
+
+      {messages, %{rows: rows}, _metadata} =
+        scan(
+          table: table,
+          fetch_size: 1_000,
+          columns: ["id"],
+          where: {"id >= ? AND id < ? AND payload <> ? -- not 'x'", [1_000, 9_000, "o'brien"]}
+        )
+
+      expected_ids = Enum.reject(1_000..8_999, &(rem(&1, 7) == 0))
+      assert ids(messages) == expected_ids
+      assert rows == length(expected_ids)
+      assert messages |> Enum.map(& &1.data.names) |> Enum.uniq() == [["id"]]
+    end
+
+    test "a distributed scan reads every selected row once, from the slice of its file", %{schema: schema} do
+      table = Iceberg.create_table!(@pool, schema)
+      for file <- 0..7, do: Iceberg.insert!(@pool, table, (file * 1_000)..(file * 1_000 + 999))
+      snapshot = @pool |> Iceberg.snapshots(table) |> List.last()
+      expected_ids = Enum.filter(0..7_999, &(rem(&1, 3) == 0 and &1 < 5_500))
+      name = unique_name()
+      Telemetry.attach_pipeline(name)
+
+      start_pipeline(
+        name,
+        [
+          table: table,
+          snapshot_id: snapshot,
+          fetch_size: 100,
+          columns: ["payload", "id"],
+          where: {"id % ? = 0 AND id < ?", [3, 5_500]},
+          distribute: [slice_rows: 1_000]
+        ],
+        producer_concurrency: 2,
+        processor_concurrency: 4,
+        max_demand: 2
+      )
+
+      for _stage <- 1..2 do
+        assert_receive {:telemetry, [:off_broadway_iceberg, :scan, :stop], measurements, %{name: ^name}}, 60_000
+        assert measurements == Map.merge(measurements, %{rows: length(expected_ids), failed_batches: 0})
+      end
+
+      messages = drain_handled()
+      assert messages |> ids() |> Enum.uniq() == expected_ids
+      assert messages |> Enum.map(& &1.data.names) |> Enum.uniq() == [["payload", "id"]]
+
+      # Each insert made one data file, and each file is a slice, in path order. Slices
+      # whose file holds no selected rows emit nothing.
+      %{rows: files} =
+        QuackDB.query!(@pool, "SELECT file_path FROM iceberg_files(?) WHERE content = 0 ORDER BY file_path", [table])
+
+      slice_of_file = files |> List.flatten() |> Enum.with_index() |> Map.new()
+      %{rows: rows} = QuackDB.query!(@pool, "SELECT id, filename FROM #{table}")
+      slice_of_id = Map.new(rows, fn [id, path] -> {id, slice_of_file[path]} end)
+
+      for message <- messages, id <- QuackDB.Columns.get(message.data, "id") do
+        assert slice_of_id[id] == message.metadata.slice
+      end
+    end
+
+    test "a column that does not exist fails a distributed scan before it reads any slice", %{schema: schema} do
+      table = Iceberg.create_table!(@pool, schema)
+      snapshot = Iceberg.insert!(@pool, table, 0..99)
+      name = unique_name()
+      Telemetry.attach_pipeline(name)
+
+      start_pipeline(name,
+        table: table,
+        snapshot_id: snapshot,
+        columns: ["id", "amount"],
+        distribute: true
+      )
+
+      assert_receive {:telemetry, [:off_broadway_iceberg, :scan, :exception], _measurements, %{name: ^name} = metadata},
+                     30_000
+
+      assert %QuackDB.Error{message: message} = metadata.reason
+      assert message =~ "amount"
+      assert drain_handled() == []
+    end
+
+    test "DuckDB pushes the columns and the condition into its Iceberg scan", %{schema: schema} do
+      table = Iceberg.create_table!(@pool, schema)
+      snapshot = Iceberg.insert!(@pool, table, 0..99)
+      [[path]] = QuackDB.query!(@pool, "SELECT file_path FROM iceberg_files(?)", [table]).rows
+
+      # The statement a slice of the scan runs.
+      %{rows: [[_kind, plan]]} =
+        QuackDB.query!(
+          @pool,
+          "EXPLAIN SELECT \"id\" FROM (SELECT * FROM #{table} AT (VERSION => ?) WHERE filename IN (?)) " <>
+            "WHERE (\nid > 42 -- a comment\n)",
+          [snapshot, path]
+        )
+
+      [scan] = Regex.run(~r/ICEBERG_SCAN.*/s, plan)
+      assert scan =~ ~r/Projections:\s*id\s/
+      assert scan =~ "id>42" or scan =~ "id > 42"
+      refute scan =~ "payload"
+    end
+  end
+
   describe "multiple pipelines" do
     test "scan the same table at the same time without interfering", %{schema: schema} do
       table = Iceberg.create_table!(@pool, schema)

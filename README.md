@@ -130,6 +130,29 @@ natural but are not reliable:
 - A `Task` started before the pipeline does not wait for the setup to finish, so the scan
   can start before the catalog is attached.
 
+### Selecting columns and rows
+
+`:columns` and `:where` read only part of the snapshot:
+
+```elixir
+{OffBroadway.Iceberg.Producer,
+ connection: MyApp.QuackDB,
+ table: "lake.betting.events",
+ snapshot_id: 123456789,
+ columns: ["event_id", "occurred_at", "amount"],
+ where: {"occurred_at >= ? AND occurred_at < ?", [~U[2026-10-01 00:00:00Z], ~U[2026-11-01 00:00:00Z]]}}
+```
+
+DuckDB pushes both into its Iceberg scan, so it reads only those columns, and can skip the
+parts of data files whose statistics rule the condition out. Delete files still apply.
+QuackDB writes the params into the condition as SQL literals. The condition itself is SQL,
+run as written: build it in your code, never from user input.
+
+The condition must select the same rows every time it runs, so it must not use `now()`,
+`current_date`, `random()` or anything else that changes. A distributed scan runs it once
+per slice, and a checkpointed job on every run. Producers that select different columns or
+rows never share a scan or a job.
+
 ### Distributed scans
 
 > #### Experimental {: .warning}
@@ -212,8 +235,8 @@ slice at once without overwriting each other.
 
 - `:job_id` names the job: one scan of one snapshot. Every run of the job checks, before
   reading a row, that its table, snapshot and slices are those of the first run, and fails
-  if any is not. Keep `:table`'s name and `:slice_rows` for the life of a job, and use a new
-  job id to start over.
+  if any is not. Keep `:table`'s name, `:slice_rows`, `:columns` and `:where` for the life
+  of a job, and use a new job id to start over.
 - Producers share a job's scan if they have the same job id and record it in the same
   bucket and prefix. Producers that record it elsewhere scan it apart.
 - A slice is recorded once every one of its batches was acknowledged successfully, and only
@@ -243,6 +266,10 @@ and `OffBroadway.Iceberg.Checkpoint` to record checkpoints elsewhere.
   snapshot that was current at that time.
 - `:fetch_size` - The maximum number of rows in one message (default `10_000`). It is not
   Broadway's batcher `:batch_size`, which counts messages.
+- `:columns` - The columns to read, such as `["id", "amount"]`. Every column by default.
+- `:where` - A SQL condition the rows must meet, such as `"amount > 100"`, or
+  `{condition, params}` with a `?` for each param. Every row by default. See "Selecting
+  columns and rows" above.
 - `:distribute` - `true`, or `[slice_rows: rows]`, shares the scan between the producers of
   the pipeline on every connected node. See "Distributed scans" above.
 - `:checkpoint` - `[job_id: id, backend: {module, options}]` records finished slices, so

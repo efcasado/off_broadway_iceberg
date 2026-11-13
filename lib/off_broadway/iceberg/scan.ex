@@ -9,7 +9,8 @@ defmodule OffBroadway.Iceberg.Scan do
   # stream, fetching a batch only once the producer has asked for one.
   #
   # A scan reads either the whole snapshot or, with a `:slice` of `{:files, paths}`, the
-  # rows of those data files.
+  # rows of those data files, and selects `:columns` and the rows that meet `:where` from
+  # them.
   #
   # Messages to the producer, in order: `{:snapshot, id | nil}`, any number of
   # `{:batch, %QuackDB.Columns{}}`, then `:done` or `{:error, reason}`. Each is sent as
@@ -92,7 +93,11 @@ defmodule OffBroadway.Iceberg.Scan do
     parts |> Enum.map_intersperse(".", &QuackDB.Type.quote_identifier/1) |> IO.iodata_to_binary()
   end
 
-  defp name_part?(part) do
+  @doc """
+  Whether `part` can be quoted as an identifier: a non-empty UTF-8 string without NUL.
+  """
+  @spec name_part?(term()) :: boolean()
+  def name_part?(part) do
     is_binary(part) and part != "" and String.valid?(part) and not String.contains?(part, <<0>>)
   end
 
@@ -116,6 +121,8 @@ defmodule OffBroadway.Iceberg.Scan do
         {:plan, nil, []}
 
       snapshot_id ->
+        check_selection(conn, table, snapshot_id, opts)
+
         # The live data files of the snapshot, from its manifests. Reading them needs only
         # the catalog, unlike the files' own metadata, which may need storage credentials
         # that only the Iceberg scan has.
@@ -128,6 +135,15 @@ defmodule OffBroadway.Iceberg.Scan do
           )
 
         {:plan, snapshot_id, slices(files, Keyword.fetch!(opts, :slice_rows))}
+    end
+  end
+
+  # A column or condition DuckDB cannot read fails the plan, before any slice is read or
+  # its job recorded. With LIMIT 0, DuckDB binds the query without reading any rows.
+  defp check_selection(conn, table, snapshot_id, opts) do
+    if Keyword.get(opts, :columns) || Keyword.get(opts, :where) do
+      {statement, params} = select(table, opts)
+      QuackDB.query!(conn, [statement, " LIMIT 0"], [snapshot_id | params])
     end
   end
 
@@ -157,8 +173,7 @@ defmodule OffBroadway.Iceberg.Scan do
     if snapshot_id do
       # Running the query already fetches the first batch, so it waits for demand too.
       credit = await_credit(ref, 0)
-      {filter, params} = slice_filter(Keyword.get(opts, :slice))
-      statement = ["SELECT * FROM ", table, " AT (VERSION => ?)", filter]
+      {statement, params} = select(table, opts)
 
       _unused_credit =
         conn
@@ -168,6 +183,30 @@ defmodule OffBroadway.Iceberg.Scan do
 
     :done
   end
+
+  # The query of a scan, and its parameters but the snapshot id. Columns and a condition
+  # select from the rows of the slice in a query of their own, so that no condition can
+  # change which files the slice reads. DuckDB still pushes both into its Iceberg scan.
+  # The condition already has its parameters written in.
+  defp select(table, opts) do
+    {filter, params} = slice_filter(Keyword.get(opts, :slice))
+    rows = ["SELECT * FROM ", table, " AT (VERSION => ?)", filter]
+
+    statement =
+      case {Keyword.get(opts, :columns), Keyword.get(opts, :where)} do
+        {nil, nil} -> rows
+        {columns, where} -> ["SELECT ", projection(columns), " FROM (", rows, ")", condition(where)]
+      end
+
+    {statement, params}
+  end
+
+  defp projection(nil), do: "*"
+  defp projection(columns), do: Enum.map_intersperse(columns, ", ", &QuackDB.Type.quote_identifier/1)
+
+  defp condition(nil), do: []
+  # On lines of its own, so that a comment at the end of the condition ends with it.
+  defp condition(where), do: [" WHERE (\n", where, "\n)"]
 
   defp slice_filter(nil), do: {[], []}
 
