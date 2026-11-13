@@ -5,6 +5,14 @@
 #   docker compose -f examples/docker-compose.yml down --volumes
 #
 # It listens on port 55432, so that it does not clash with a PostgreSQL already on 5432.
+#
+# fake-gcs-server for examples/checkpointed_backfill.exs, on port 4443:
+#
+#   docker compose -f examples/docker-compose.yml up --detach --wait fake-gcs
+#   elixir examples/checkpointed_backfill.exs --crash-after 1
+#   elixir examples/checkpointed_backfill.exs
+#
+# It keeps objects in memory, so stopping it forgets every checkpoint.
 name: off_broadway_iceberg_examples
 
 services:
@@ -16,6 +24,17 @@ services:
       - "55432:5432"
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 1s
+      timeout: 5s
+      retries: 30
+
+  fake-gcs:
+    image: fsouza/fake-gcs-server:1.56.1@sha256:797ce226d62f947c009dc40246b30cfb456b8473d8241407f9d6f2c04e4d69ef
+    command: ["-scheme", "http", "-port", "4443", "-backend", "memory", "-public-host", "localhost:4443"]
+    ports:
+      - "4443:4443"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:4443/storage/v1/b"]
       interval: 1s
       timeout: 5s
       retries: 30
