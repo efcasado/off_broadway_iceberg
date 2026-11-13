@@ -255,11 +255,14 @@ the snapshot again. It emits telemetry along the way:
   `:batches`, `:rows`, `:failed_batches` and `:local_failed_batches`.
 - `[:off_broadway_iceberg, :scan, :exception]` when the scan fails.
 
-A `:stop` event with `failed_batches: 0` means every batch was processed successfully.
-With `failed_batches` above 0, the whole snapshot was read, but that many batches failed
+A `:stop` event with `failed_batches: 0` means every row was processed successfully. With
+`failed_batches` above 0, the whole snapshot was read, but that many batches failed
 downstream. A scan that could not read the snapshot emits `:exception` instead, never
 `:stop`. `:local_failed_batches` counts the batches this producer emitted that failed,
-which is the same number unless the scan is distributed (see below).
+which is the same number unless the scan is distributed. In a distributed scan,
+`failed_batches: 0` means every slice has at least one copy processed without failed
+batches. Other copies may have failed batches, which count in `:local_failed_batches`. See
+"Distributed scans" above.
 
 Attach telemetry handlers before starting the pipeline, since a scan that fails early
 emits `:exception` right away. The events are the only record of the outcome: the producer

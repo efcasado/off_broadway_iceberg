@@ -583,9 +583,15 @@ defmodule OffBroadway.Iceberg.Producer do
   # Producers only share progress if they planned the same slices, because slices are
   # known to each other by their position in the plan.
   defp join(state) do
-    plan = :erlang.phash2(state.units)
+    plan = state.units |> Tuple.to_list() |> Distribution.fingerprint()
     group = {state.name, Scan.table_parts(state.table), state.snapshot_id, plan}
     {monitor, members} = Distribution.join(group)
+
+    Logger.debug(
+      "Joined the scan of #{inspect(state.table)} at snapshot #{inspect(state.snapshot_id)} with plan " <>
+        "#{plan |> Base.encode16(case: :lower) |> binary_part(0, 12)}: #{state.slices} slices, " <>
+        "#{length(members)} members"
+    )
 
     %{state | group: group, monitor: monitor, members: members}
   end

@@ -52,6 +52,21 @@ defmodule OffBroadway.Iceberg.Distribution do
   end
 
   @doc """
+  Identifies a plan by its slices: SHA-256 over the paths of their data files, slice by
+  slice, in order. Every slice, and every path in it, is length-prefixed, so that no two
+  plans encode alike.
+  """
+  @spec fingerprint([[String.t()]]) :: binary()
+  def fingerprint(slices) do
+    encoded =
+      for paths <- slices do
+        [<<length(paths)::32>> | Enum.map(paths, &[<<byte_size(&1)::32>>, &1])]
+      end
+
+    :crypto.hash(:sha256, [<<length(slices)::32>> | encoded])
+  end
+
+  @doc """
   Sends finished slices to `members`, except the caller.
   """
   @spec announce([pid()], term(), done()) :: :ok

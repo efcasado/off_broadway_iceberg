@@ -39,7 +39,7 @@ defmodule OffBroadwayIceberg.MixProject do
   def application do
     [
       mod: {OffBroadway.Iceberg.Application, []},
-      extra_applications: [:logger]
+      extra_applications: [:crypto, :logger]
     ]
   end
 
