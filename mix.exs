@@ -157,7 +157,7 @@ defmodule OffBroadwayIceberg.MixProject do
   defp package do
     [
       name: "off_broadway_iceberg",
-      files: ~w(lib .formatter.exs mix.exs README.md LICENSE),
+      files: ~w(lib guides .formatter.exs mix.exs README.md LICENSE),
       licenses: ~w(MIT),
       links: %{
         "GitHub" => "https://github.com/efcasado/off_broadway_iceberg"
