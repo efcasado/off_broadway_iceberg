@@ -38,6 +38,25 @@ defmodule OffBroadway.Iceberg.DistributionTest do
     end
   end
 
+  describe "plan fingerprints" do
+    test "are the same for the same plan, and differ for plans that only differ in grouping" do
+      plans = [
+        [["a"], ["b"]],
+        [["a", "b"]],
+        [["ab"]],
+        [["a"], ["b"], []],
+        [["b"], ["a"]],
+        [["a", ""], ["b"]]
+      ]
+
+      fingerprints = Enum.map(plans, &Distribution.fingerprint/1)
+
+      assert Enum.uniq(fingerprints) == fingerprints
+      assert Distribution.fingerprint([["a"], ["b"]]) == hd(fingerprints)
+      assert byte_size(hd(fingerprints)) == 32
+    end
+  end
+
   describe "options" do
     test "require a snapshot every node resolves the same way" do
       assert_raise ArgumentError, ~r/requires an integer or \{:as_of, datetime\} :snapshot_id with :distribute/, fn ->
