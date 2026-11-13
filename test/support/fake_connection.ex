@@ -15,7 +15,10 @@ defmodule OffBroadway.Iceberg.Test.FakeConnection do
   Script keys:
 
   - `:refs` - rows returned by the `iceberg_refs` query (default `[[42]]`)
-  - `:rows` - rows of the scan, as one-element lists (default `[]`)
+  - `:history` - rows returned by the `iceberg_history` query (default `[[42]]`)
+  - `:rows` - rows of the scan, as one-element lists (default `[]`). A scan of slice `i`
+    of `n` gets the rows whose first value is `i` modulo `n`, standing in for DuckDB's
+    `hash/1`
   - `:fail` - `{:bind | :refs | :declare, exception}` or `{{:fetch, n}, exception}`
     makes that call fail; `{{:fetch, n}, {:disconnect, exception}}` also disconnects
   """
@@ -79,6 +82,9 @@ defmodule OffBroadway.Iceberg.Test.FakeConnection do
         String.contains?(query.statement, "iceberg_refs") ->
           respond(state, :refs, result(["snapshot_id"], Map.get(state.script, :refs, [[42]])))
 
+        String.contains?(query.statement, "iceberg_history") ->
+          respond(state, :history, result(["snapshot_id"], Map.get(state.script, :history, [[42]])))
+
         true ->
           {:ok, result([], []), state}
       end
@@ -96,7 +102,7 @@ defmodule OffBroadway.Iceberg.Test.FakeConnection do
 
     case respond(state, :declare, :ok) do
       {:ok, :ok, state} ->
-        rows = Map.get(state.script, :rows, [])
+        rows = state.script |> Map.get(:rows, []) |> slice(params)
         {:ok, query, cursor, put_in(state.cursors[cursor], %{rows: rows, fetched: 0})}
 
       error ->
@@ -124,6 +130,9 @@ defmodule OffBroadway.Iceberg.Test.FakeConnection do
     report(state, {:deallocate})
     {:ok, result([], []), %{state | cursors: Map.delete(state.cursors, cursor)}}
   end
+
+  defp slice(rows, [_snapshot_id, count, index]), do: Enum.filter(rows, fn [id | _] -> rem(id, count) == index end)
+  defp slice(rows, [_snapshot_id]), do: rows
 
   defp respond(state, call, ok) do
     case Map.get(state.script, :fail) do

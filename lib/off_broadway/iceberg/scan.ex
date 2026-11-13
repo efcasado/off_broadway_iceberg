@@ -8,6 +8,9 @@ defmodule OffBroadway.Iceberg.Scan do
   # blocking it. This process checks out one connection for the whole scan and reads the
   # stream, fetching a batch only once the producer has asked for one.
   #
+  # A scan reads either the whole snapshot or, with a `:slice` of `{key, count, index}`,
+  # the rows whose key hashes to `index` out of `count` slices.
+  #
   # Messages to the producer, in order: `{:snapshot, id | nil}`, any number of
   # `{:batch, %QuackDB.Columns{}}`, then `:done` or `{:error, reason}`. Each is sent as
   # `{OffBroadway.Iceberg.Scan, ref, event}`.
@@ -63,7 +66,19 @@ defmodule OffBroadway.Iceberg.Scan do
 
   def table_parts(_table), do: :error
 
-  defp name_part?(part) do
+  @doc """
+  Quotes name parts and joins them with dots.
+  """
+  @spec quote_name([String.t()]) :: String.t()
+  def quote_name(parts) do
+    parts |> Enum.map_intersperse(".", &QuackDB.Type.quote_identifier/1) |> IO.iodata_to_binary()
+  end
+
+  @doc """
+  Whether `part` can be quoted as an identifier.
+  """
+  @spec name_part?(term()) :: boolean()
+  def name_part?(part) do
     is_binary(part) and part != "" and String.valid?(part) and not String.contains?(part, <<0>>)
   end
 
@@ -85,31 +100,50 @@ defmodule OffBroadway.Iceberg.Scan do
   end
 
   defp scan(conn, producer, ref, opts) do
-    table =
-      opts
-      |> Keyword.fetch!(:table)
-      |> table_parts()
-      |> Enum.map_intersperse(".", &QuackDB.Type.quote_identifier/1)
-      |> IO.iodata_to_binary()
-
+    table = opts |> Keyword.fetch!(:table) |> table_parts() |> quote_name()
     snapshot_id = resolve_snapshot(conn, table, Keyword.fetch!(opts, :snapshot_id))
     send(producer, {__MODULE__, ref, {:snapshot, snapshot_id}})
 
     if snapshot_id do
       # Running the query already fetches the first batch, so it waits for demand too.
       credit = await_credit(ref, 0)
-      statement = ["SELECT * FROM ", table, " AT (VERSION => ?)"]
+      {filter, params} = slice_filter(Keyword.get(opts, :slice))
+      statement = ["SELECT * FROM ", table, " AT (VERSION => ?)", filter]
 
       _unused_credit =
         conn
-        |> QuackDB.columnar_batches(statement, [snapshot_id], max_rows: Keyword.fetch!(opts, :fetch_size))
+        |> QuackDB.columnar_batches(statement, [snapshot_id | params], max_rows: Keyword.fetch!(opts, :fetch_size))
         |> Enum.reduce(credit, &deliver(&1, &2, producer, ref))
     end
 
     :done
   end
 
+  defp slice_filter(nil), do: {[], []}
+
+  defp slice_filter({key, count, index}) do
+    columns = Enum.map_intersperse(key, ", ", &QuackDB.Type.quote_identifier/1)
+    {[" WHERE hash(", columns, ") % ? = ?"], [count, index]}
+  end
+
   defp resolve_snapshot(_conn, _table, snapshot_id) when is_integer(snapshot_id), do: snapshot_id
+
+  # The snapshot log records when each snapshot became the table's current one, so this
+  # resolves to the same snapshot wherever it runs. Before the first snapshot, there is
+  # none. Iceberg records the times in UTC.
+  defp resolve_snapshot(conn, table, {:as_of, %DateTime{} = as_of}) do
+    QuackDB.query!(conn, ["SELECT * FROM ", table, " LIMIT 0"])
+    as_of = as_of |> DateTime.to_unix(:microsecond) |> DateTime.from_unix!(:microsecond) |> DateTime.to_naive()
+
+    case QuackDB.query!(
+           conn,
+           "SELECT snapshot_id FROM iceberg_history(?) WHERE made_current_at <= ? ORDER BY made_current_at DESC LIMIT 1",
+           [table, as_of]
+         ) do
+      %{rows: [[snapshot_id]]} -> snapshot_id
+      %{rows: []} -> nil
+    end
+  end
 
   defp resolve_snapshot(conn, table, :current) do
     # iceberg_refs/1 reads a name it cannot resolve as a file path, and the error it then
