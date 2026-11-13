@@ -9,9 +9,12 @@ defmodule OffBroadway.Iceberg.Checkpoint do
   ## Implementing a backend
 
   A backend is a module that implements this behaviour. The producer calls `c:init/1`
-  when it validates its options, and `c:load/2` and `c:complete/4` from processes of its
-  own, so a slow backend does not hold up the pipeline. Several producers, on several
+  and `c:namespace/1` when it starts, and `c:load/2` and `c:complete/4` from processes of
+  its own, so a slow backend does not hold up the pipeline. Several producers, on several
   nodes, call them for the same job at the same time.
+
+  Producers only share a scan's progress while it runs if they record it in the same
+  place, as `c:namespace/1` tells.
 
   A backend keeps two kinds of records per job, both written once and never changed:
 
@@ -36,7 +39,8 @@ defmodule OffBroadway.Iceberg.Checkpoint do
     data files.
   - `:slices` - The number of slices in the plan.
 
-  Two jobs with the same `:id`, `:snapshot_id` and `:plan` are the same job.
+  Every field is immutable: a run of a job loads it only if every field is the same as
+  the first run recorded.
   """
   @type job :: %{
           id: String.t(),
@@ -62,10 +66,21 @@ defmodule OffBroadway.Iceberg.Checkpoint do
   @callback init(opts :: keyword()) :: {:ok, config :: term()} | {:error, String.t()}
 
   @doc """
+  Identifies where the backend records jobs, such as a bucket and a prefix. Producers
+  with the same job id share a scan only if their namespaces are equal, so that one never
+  skips a slice that only another storage recorded.
+
+  It must be equal on every node exactly when the backends read and write the same
+  records. When unsure, tell storages apart: producers that do not share a scan only read
+  slices twice. Build it from the options that name the storage, not from all of them.
+  """
+  @callback namespace(config :: term()) :: term()
+
+  @doc """
   Records the job, unless it is recorded already, and returns its finished slices.
 
-  Returns an error, and no slices, if a different job is recorded under the same id, or
-  if the backend cannot tell which slices are finished.
+  Returns an error, and no slices, if a job is recorded under the same id with any field
+  that differs, or if the backend cannot tell which slices are finished.
   """
   @callback load(config :: term(), job()) :: {:ok, %{slice() => result()}} | {:error, term()}
 

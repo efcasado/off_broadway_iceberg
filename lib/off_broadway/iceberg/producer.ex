@@ -92,8 +92,8 @@ defmodule OffBroadway.Iceberg.Producer do
           required: true,
           doc: """
           Names the job, the same on every node and every run, such as
-          `"events-backfill-2026-11"`. Runs with the same job id resume each other's
-          progress. A string of 1 to #{@max_job_id_bytes} bytes, other than `"."` and `".."`.
+          `"events-backfill-2026-11"`. Runs with the same job id, recorded in the same
+          place, resume each other's progress. A string of 1 to #{@max_job_id_bytes} bytes, other than `"."` and `".."`.
           """
         ],
         backend: [
@@ -313,7 +313,8 @@ defmodule OffBroadway.Iceberg.Producer do
 
   - All members must use the same pipeline name, `:table`, `:snapshot_id` and
     `:distribute`. Producers that differ in any of them scan separately. With
-    `:checkpoint`, the same `:job_id` takes the place of the pipeline name.
+    `:checkpoint`, the same `:job_id`, recorded in the same place, takes the place of
+    the pipeline name. See "Checkpoints" below.
   - `:snapshot_id` must be an integer or `{:as_of, datetime}`. Members resolving
     `:current` at different times could read different snapshots.
 
@@ -349,18 +350,24 @@ defmodule OffBroadway.Iceberg.Producer do
   ### Jobs
 
   A job is one scan of one snapshot, named by `:job_id`. The first run of a job records
-  its snapshot and the fingerprint of its plan. Every later run checks that it planned
-  the same snapshot and slices before it reads a row, and fails its scan with an
-  `OffBroadway.Iceberg.Checkpoint.Error` if it did not, changing nothing. A different
-  `:slice_rows` makes a different plan, so keep it for the life of a job, and use a new
-  job id to scan again from the start.
+  it: its id, its table, its snapshot, the fingerprint of its plan and its number of
+  slices. Every later run checks that all of them are the same before it reads a row,
+  and fails its scan with an `OffBroadway.Iceberg.Checkpoint.Error` if any is not,
+  changing nothing. A different `:slice_rows` makes a different plan, so keep it for the
+  life of a job, and use a new job id to scan again from the start.
+
+  The table is recorded as its name parts, so `"lake.betting.events"` and
+  `["lake", "betting", "events"]` name the same table, but `"events"` names another one,
+  even where DuckDB resolves it to the same table. Name it the same way on every run.
 
   `{:as_of, datetime}` resolves to the same snapshot on every run while the table's
   snapshot log keeps it. A snapshot that was expired cannot be read again: the job then
   fails, rather than reading another snapshot.
 
-  Producers with the same job id share its scan, as the producers of one pipeline do
-  without checkpoints.
+  Producers share a job's scan while it runs if they have the same job id and record it
+  in the same place: for `OffBroadway.Iceberg.Checkpoint.GCS`, the same endpoint, bucket
+  and prefix. Producers that record the same job id elsewhere scan it apart, since one
+  would not find what the other recorded after a restart.
 
   ### What is recorded
 
@@ -370,11 +377,18 @@ defmodule OffBroadway.Iceberg.Producer do
   before it reads anything, and reads the others.
 
   A slice with failed batches is not recorded. The run still counts it finished, as it
-  would without checkpoints, so `:stop` reports its failed batches, and it is not
-  retried. The next run of the job reads it again, with any other slice not recorded.
-  To retry the failed batches of a job, start it again once it has stopped. Members that
-  keep running, as in a rolling redeploy, remember the slice as finished, so only a run
-  that starts with no member running reads it again.
+  would without checkpoints, so `:stop` reports its failed batches, and no member starts
+  reading it again: it is not retried. Members that were reading it already go on,
+  though, unlike without checkpoints. Only a copy that succeeded, which is recorded, ends
+  the others, and it replaces the failed one in what the members know.
+
+  The next run of the job reads every slice not recorded, those with failed batches
+  included. To retry the failed batches of a job, start it again once it has stopped.
+  Members that keep running, as in a rolling redeploy, remember the slice as finished,
+  so only a run that starts with no member running reads it again.
+
+  A producer emits `:stop` only once its own writes have returned, so a pipeline stopped
+  on `:stop` does not cut one short.
 
   ### Failures
 
@@ -383,9 +397,8 @@ defmodule OffBroadway.Iceberg.Producer do
   A backend that cannot be reached is never taken for a job without finished slices, and
   a slice whose write was not confirmed is never counted as recorded.
 
-  A producer that stops while it records a slice leaves the slice to be read again, as
-  do the slices that finish while the pipeline shuts down, if it stops before their
-  writes return.
+  A producer that stops while it records a slice, before its `:stop`, leaves the slice
+  to be read again.
 
   ### Guarantees
 
@@ -508,7 +521,7 @@ defmodule OffBroadway.Iceberg.Producer do
       # With :checkpoint, the job and its backend. The scan reads no slice before the
       # loader has returned the finished ones, and a slice it finishes is only announced
       # once its write, one of :writes by reference, has stored it.
-      checkpoint: checkpoint && %{job_id: checkpoint[:job_id], backend: checkpoint[:backend], job: nil},
+      checkpoint: checkpoint && checkpoint_state(checkpoint),
       loader: nil,
       writes: %{}
     }
@@ -721,7 +734,8 @@ defmodule OffBroadway.Iceberg.Producer do
   @doc false
   def validate_backend({module, opts}) when is_atom(module) and is_list(opts) do
     if Code.ensure_loaded?(module) and function_exported?(module, :init, 1) and
-         function_exported?(module, :load, 2) and function_exported?(module, :complete, 4) do
+         function_exported?(module, :namespace, 1) and function_exported?(module, :load, 2) and
+         function_exported?(module, :complete, 4) do
       case module.init(opts) do
         {:ok, config} -> {:ok, {module, config}}
         {:error, message} -> {:error, "invalid options for #{inspect(module)}: #{message}"}
@@ -773,6 +787,17 @@ defmodule OffBroadway.Iceberg.Producer do
     opts = Keyword.put(state.scan_opts, :slice_rows, Keyword.fetch!(distribute, :slice_rows))
 
     %{state | planner: %{pid: Scan.plan(self(), ref, opts), ref: ref}}
+  end
+
+  defp checkpoint_state(checkpoint) do
+    {backend, config} = Keyword.fetch!(checkpoint, :backend)
+
+    %{
+      job_id: Keyword.fetch!(checkpoint, :job_id),
+      backend: {backend, config},
+      namespace: backend.namespace(config),
+      job: nil
+    }
   end
 
   # A checkpointed scan reads no slice before it knows which ones a run of its job
@@ -851,9 +876,15 @@ defmodule OffBroadway.Iceberg.Producer do
 
   # Producers only share progress if they planned the same slices, because slices are
   # known to each other by their position in the plan. Checkpointed producers share it
-  # with every producer of their job, as their checkpoints do.
+  # with the producers that record the same job in the same place, whatever their
+  # pipeline, so that what they hear is what a restart would load.
   defp join(state) do
-    owner = if state.checkpoint, do: {:job, state.checkpoint.job_id}, else: state.name
+    owner =
+      case state.checkpoint do
+        nil -> state.name
+        %{backend: {backend, _config}, namespace: namespace, job_id: id} -> {:checkpoint, backend, namespace, id}
+      end
+
     group = {owner, Scan.table_parts(state.table), state.snapshot_id, state.plan}
     {monitor, members} = Distribution.join(group)
 
@@ -971,7 +1002,7 @@ defmodule OffBroadway.Iceberg.Producer do
   end
 
   defp finish_read_slice(state, %{failed: 0} = read) do
-    if match?({0, _batches, _rows}, state.done[read.slice]),
+    if succeeded?(state.done[read.slice]),
       do: finish_slice(state, read.slice, {0, read.emitted, read.rows}),
       else: write_checkpoint(state, read)
   end
@@ -1025,13 +1056,25 @@ defmodule OffBroadway.Iceberg.Producer do
   end
 
   # Another member finished the slice this producer is reading, so stop reading it. Its
-  # emitted batches are still processed and acknowledged.
+  # emitted batches are still processed and acknowledged. In a checkpointed scan, only a
+  # copy that succeeded, which is recorded, ends the others: one with failed batches ends
+  # the slice for this run, so nobody starts reading it again, but the copies already
+  # being read go on, since one of them may succeed and be recorded.
   defp drop_finished_slice(%{scan: %{slice: slice, ref: ref}} = state) when is_map_key(state.done, slice) do
-    state = stop_scan(state)
-    finish_read(%{state | reads: Map.update!(state.reads, ref, &%{&1 | dropped?: true})}, ref)
+    if state.checkpoint && not succeeded?(state.done[slice]) do
+      state
+    else
+      state = stop_scan(state)
+      finish_read(%{state | reads: Map.update!(state.reads, ref, &%{&1 | dropped?: true})}, ref)
+    end
   end
 
   defp drop_finished_slice(state), do: state
+
+  # A finished slice is a copy that succeeded, or one with failed batches. Merging keeps
+  # the one with the fewest failed batches, so a success replaces a failure.
+  defp succeeded?({0, _batches, _rows}), do: true
+  defp succeeded?(_finished), do: false
 
   defp stop_planner(%{planner: nil} = state), do: state
 
@@ -1064,8 +1107,10 @@ defmodule OffBroadway.Iceberg.Producer do
     %{state | scan: nil, requested: 0}
   end
 
-  defp maybe_complete(%{status: :running, slices: slices, done: done, reads: reads} = state)
-       when map_size(done) == slices and map_size(reads) == 0 do
+  # A checkpointed producer also waits for its own writes, so that its :stop counts the
+  # slices it recorded, and a pipeline stopped on :stop does not cut a write short.
+  defp maybe_complete(%{status: :running, slices: slices, done: done, reads: reads, writes: writes} = state)
+       when map_size(done) == slices and map_size(reads) == 0 and map_size(writes) == 0 do
     {failed, batches, rows} =
       Enum.reduce(Map.values(done), {0, 0, 0}, fn {f, b, r}, {failed, batches, rows} ->
         {failed + f, batches + b, rows + r}

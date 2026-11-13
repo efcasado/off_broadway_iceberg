@@ -6,6 +6,7 @@ defmodule OffBroadway.Iceberg.CheckpointTest do
   alias Broadway.Message
   alias OffBroadway.Iceberg.Checkpoint.Error
   alias OffBroadway.Iceberg.Checkpoint.GCS
+  alias OffBroadway.Iceberg.Distribution
   alias OffBroadway.Iceberg.Producer
   alias OffBroadway.Iceberg.Test.Checkpoint
   alias OffBroadway.Iceberg.Test.FakeConnection
@@ -23,6 +24,8 @@ defmodule OffBroadway.Iceberg.CheckpointTest do
   @files for file <- 0..(@slices - 1),
              do: {"file-#{String.pad_leading("#{file}", 2, "0")}", Enum.map((file * 10)..(file * 10 + 9), &[&1])}
   @result %{batches: 2, rows: 10}
+  # Each file is a slice of its own.
+  @plan Distribution.fingerprint(for {path, _rows} <- @files, do: [path])
 
   @stop [:off_broadway_iceberg, :scan, :stop]
   @exception [:off_broadway_iceberg, :scan, :exception]
@@ -136,13 +139,45 @@ defmodule OffBroadway.Iceberg.CheckpointTest do
       refute_receive {:fake, {:declare, _statement, _params, _max_rows}}, 200
     end
 
-    test "fails when its job id was used for another snapshot or plan", ctx do
-      Checkpoint.put_job(ctx.store, ctx.job_id, 42, :crypto.hash(:sha256, "another plan"))
+    test "fails when its job id was recorded with any other table, snapshot or plan", ctx do
+      job = %{id: ctx.job_id, table: [ctx.table], snapshot_id: 42, plan: @plan, slices: @slices}
 
-      start_member(ctx, :a)
+      # The same job resumes, so the others differ only in the field they change.
+      Checkpoint.put_job(ctx.store, job)
+      %{consumer: consumer} = start_member(ctx, :same)
+      assert_receive {:checkpoint, {:load, ^job}}
+      ManualConsumer.ask(consumer, 1_000)
+      assert_receive {:telemetry, @stop, %{rows: @rows}, _metadata}, 5_000
+      flush()
 
-      assert_receive {:telemetry, @exception, _measurements, %{reason: %Error{reason: :incompatible}}}
-      refute_receive {:fake, {:declare, _statement, _params, _max_rows}}, 200
+      for {field, value} <- [
+            table: ["lake", ctx.table],
+            snapshot_id: 41,
+            plan: :crypto.hash(:sha256, "another plan"),
+            slices: @slices + 1
+          ] do
+        {:ok, store} = Checkpoint.start_link()
+        Checkpoint.put_job(store, Map.put(job, field, value))
+
+        start_member(%{ctx | store: store}, field)
+
+        assert_receive {:telemetry, @exception, _measurements, %{reason: %Error{reason: :incompatible}}}, 5_000
+        refute_receive {:fake, {:declare, _statement, _params, _max_rows}}, 100
+      end
+    end
+
+    test "names its job's table by its parts, so both forms of a table's name resume it", ctx do
+      Telemetry.attach([@stop, @exception], &(&1.table == [ctx.table]))
+      Checkpoint.put_slices(ctx.store, ctx.job_id, Map.new(0..(@slices - 1), &{&1, @result}))
+
+      start_member(ctx, :dotted)
+      assert_receive {:checkpoint, {:load, %{table: [_table]} = job}}
+      assert_receive {:telemetry, @stop, _measurements, _metadata}, 5_000
+
+      start_member(%{ctx | table: [ctx.table]}, :list)
+      assert_receive {:checkpoint, {:load, ^job}}
+      assert_receive {:telemetry, @stop, _measurements, %{table: [_table]}}, 5_000
+      refute_received {:telemetry, @exception, _measurements, _metadata}
     end
 
     test "fails when the backend loads slices the plan does not have", ctx do
@@ -217,7 +252,7 @@ defmodule OffBroadway.Iceberg.CheckpointTest do
 
     test "is shared by the producers of its job, which record every slice", ctx do
       %{job_id: job_id} = ctx
-      members = for id <- [:a, :b], do: start_member(ctx, id, demand: 0)
+      members = for id <- [:a, :b], do: start_member(ctx, id)
       Enum.each(members, &ManualConsumer.ask(&1.consumer, 1_000))
 
       for _member <- members do
@@ -231,19 +266,74 @@ defmodule OffBroadway.Iceberg.CheckpointTest do
       assert ctx.store |> Checkpoint.slices(job_id) |> map_size() == @slices
     end
 
+    test "is not shared with producers that record the same job elsewhere", ctx do
+      %{job_id: job_id} = ctx
+      {:ok, elsewhere} = Checkpoint.start_link()
+
+      a = start_member(ctx, :a)
+      b = start_member(%{ctx | store: elsewhere}, :b)
+      Enum.each([a, b], &ManualConsumer.ask(&1.consumer, 1_000))
+
+      for _member <- [a, b] do
+        assert_receive {:telemetry, @stop, %{rows: @rows, batches: @batches, failed_batches: 0}, %{job_id: ^job_id}},
+                       5_000
+      end
+
+      # Each read every slice, and recorded it where the other would not have.
+      assert length(received(:a)) == @batches
+      assert length(received(:b)) == @batches
+      assert ctx.store |> Checkpoint.slices(job_id) |> map_size() == @slices
+      assert elsewhere |> Checkpoint.slices(job_id) |> map_size() == @slices
+    end
+
     test "is taken over by the other producers of its job when one cannot record its slices", ctx do
       %{job_id: job_id} = ctx
-      {:ok, failing} = Checkpoint.start_link()
-      Checkpoint.fail(failing, :complete, %Error{reason: :unavailable, message: "GCS responded 503"})
+      error = %Error{reason: :unavailable, message: "GCS responded 503"}
 
-      a = start_member(ctx, :a, demand: 0)
-      b = start_member(%{ctx | store: failing}, :b, demand: 0)
+      a = start_member(ctx, :a)
+      b = start_member(ctx, :b, backend: [fail_complete: error])
       ManualConsumer.ask(a.consumer, 1_000)
       ManualConsumer.ask(b.consumer, 1_000)
 
       assert_receive {:telemetry, @exception, _measurements, %{reason: %Error{reason: :unavailable}}}, 5_000
       assert_receive {:telemetry, @stop, %{rows: @rows, failed_batches: 0}, %{job_id: ^job_id}}, 5_000
       assert ctx.store |> Checkpoint.slices(job_id) |> map_size() == @slices
+    end
+
+    test "goes on reading a slice whose other copy failed, and records it", ctx do
+      %{job_id: job_id} = ctx
+      %{producer: producer, consumer: consumer} = start_member(ctx, :a)
+      ManualConsumer.ask(consumer, 1)
+      assert_receive {:messages, :a, [%{metadata: %{slice: 0}}]}, 5_000
+
+      # Another member's copy of slice 0 had a failed batch.
+      group = :sys.get_state(producer).state.group
+      send(producer, {Distribution, group, {:done, %{0 => {1, 2, 10}}}})
+      assert %{scan: %{slice: 0}} = :sys.get_state(producer).state
+
+      ManualConsumer.ask(consumer, 1_000)
+
+      assert_receive {:telemetry, @write, _measurements, %{slice: 0}}, 5_000
+      assert_receive {:telemetry, @stop, %{failed_batches: 0, rows: @rows, batches: @batches}, _metadata}, 5_000
+      assert ctx.store |> Checkpoint.slices(job_id) |> map_size() == @slices
+    end
+
+    test "reports :stop only once its own writes have returned", ctx do
+      Checkpoint.hold(ctx.store)
+      %{producer: producer, consumer: consumer} = start_member(ctx, :a)
+      # The two messages of slice 0, and the request that ends it.
+      ManualConsumer.ask(consumer, 3)
+      assert_receive {:checkpoint, {:complete, _job_id, 0, @result}}, 5_000
+
+      # Another member finished and recorded every slice.
+      group = :sys.get_state(producer).state.group
+      send(producer, {Distribution, group, {:done, Map.new(0..(@slices - 1), &{&1, {0, 2, 10}})}})
+      refute_receive {:telemetry, @stop, _measurements, _metadata}, 200
+
+      Checkpoint.release(ctx.store)
+
+      assert_receive {:telemetry, @write, _measurements, %{slice: 0}}, 5_000
+      assert_receive {:telemetry, @stop, %{rows: @rows, failed_batches: 0}, _metadata}, 5_000
     end
 
     test "of a snapshot that does not exist yet completes without a job", ctx do
@@ -272,7 +362,9 @@ defmodule OffBroadway.Iceberg.CheckpointTest do
     Keyword.merge([connection: MyApp.QuackDB, table: "events", snapshot_id: 7, distribute: true], opts)
   end
 
-  defp checkpoint(job_id, store), do: [job_id: job_id, backend: {Checkpoint, store: store}]
+  defp checkpoint(job_id, store, backend_opts \\ []) do
+    [job_id: job_id, backend: {Checkpoint, Keyword.put(backend_opts, :store, store)}]
+  end
 
   # A producer of the job, on a fake database of its own, and a consumer that forwards
   # messages to the test as `{:messages, id, messages}`, acknowledging them unless
@@ -291,7 +383,7 @@ defmodule OffBroadway.Iceberg.CheckpointTest do
       snapshot_id: Keyword.get(opts, :snapshot_id, 42),
       fetch_size: 5,
       distribute: [slice_rows: 10],
-      checkpoint: checkpoint(ctx.job_id, ctx.store)
+      checkpoint: checkpoint(ctx.job_id, ctx.store, Keyword.get(opts, :backend, []))
     ]
 
     producer = start_supervised!(Supervisor.child_spec({Producer, producer_opts}, id: id, restart: :temporary))

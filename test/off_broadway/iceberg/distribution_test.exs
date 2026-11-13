@@ -235,6 +235,25 @@ defmodule OffBroadway.Iceberg.DistributionTest do
       assert %{failed_batches: 0, local_failed_batches: 1, rows: @rows, batches: @batches} = measurements
     end
 
+    test "of another member's copy of a slice end this producer's copy, without checkpoints" do
+      pool = start_pool(files: @files)
+      table = unique_table()
+      Telemetry.attach_scan(table)
+
+      %{producer: producer, consumer: consumer} = start_member(pool, table, :a)
+      ManualConsumer.ask(consumer, 1)
+      assert_receive {:messages, :a, [%{metadata: %{slice: 0}}]}
+
+      group = :sys.get_state(producer).state.group
+      send(producer, {Distribution, group, {:done, %{0 => {1, 2, 10}}}})
+      refute match?(%{scan: %{slice: 0}}, :sys.get_state(producer).state)
+
+      ManualConsumer.ask(consumer, 1_000)
+
+      assert_receive {:telemetry, [:off_broadway_iceberg, :scan, :stop], %{failed_batches: 1, rows: @rows}, _}, 5_000
+      refute Enum.any?(received(:a), &(&1.metadata.slice == 0))
+    end
+
     test "of the only copy of a slice count as the scan's too" do
       pool = start_pool(files: @files)
       table = unique_table()
