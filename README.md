@@ -144,26 +144,35 @@ and keep sharing it as an autoscaler adds and removes nodes:
  connection: MyApp.QuackDB,
  table: "lake.betting.events",
  snapshot_id: {:as_of, ~U[2026-11-12 00:00:00Z]},
- distribute: [key: "event_id", slices: 64]}
+ distribute: true}
 ```
 
-The snapshot is divided into slices by `hash(key)`. Every producer stage, on every node,
-joins a process group (OTP's `:pg`), reads the slices it owns, and tells the others which
-slices it finished. When a node joins or leaves, only the slices of that node move. Once
-every slice is finished, every producer emits `:stop`, with the counts of the whole scan.
+Every producer plans the scan from the snapshot's manifests: small data files are grouped
+into slices of at least a million rows (`distribute: [slice_rows: rows]` changes that),
+and larger files make a slice each. Every producer stage, on every node, then joins a
+process group (OTP's `:pg`), reads the slices it owns, and tells the others which slices
+it finished. When a node joins or leaves, only the slices of that node move.
 
-Nothing is stored outside the running nodes, which comes with trade-offs:
+A slice is read by the names of its files, so DuckDB opens each data file once in all.
+On a table of 4 million rows in 8 files, 8 slices cost 1.08 times the CPU of one full
+scan. A table stored in a single large file makes a single slice, though, which only one
+producer can read.
 
-- The nodes must be connected to each other. A node only sees the producers on nodes it
-  is connected to.
+Once every slice is finished, every producer emits `:stop`: every row was processed at
+least once, by this producer or by one it heard from, and every batch this producer
+emitted was acknowledged. Nothing is stored outside the running nodes, which comes with
+trade-offs:
+
+- The nodes must be connected to each other. A producer only sees the producers on nodes
+  it is connected to.
 - `:snapshot_id` must be an id or `{:as_of, datetime}`, the same on every node, so that
   every producer reads the same snapshot.
-- A slice can be read twice while producers come and go, so writes must be idempotent.
+- A slice can be processed more than once while producers come and go, or when nodes
+  cannot reach each other. Writes must be idempotent.
 - If every node restarts at once, the scan starts over.
-- Each slice scans the whole snapshot in DuckDB. What slices divide is the transfer and
-  decoding of rows, and their processing.
 
-See "Distributed scans" in `OffBroadway.Iceberg.Producer` for the details.
+See "Distributed scans" in `OffBroadway.Iceberg.Producer` for what `:stop` guarantees
+exactly.
 
 ### Options
 
@@ -178,8 +187,8 @@ See "Distributed scans" in `OffBroadway.Iceberg.Producer` for the details.
   snapshot that was current at that time.
 - `:fetch_size` - The maximum number of rows in one message (default `10_000`). It is not
   Broadway's batcher `:batch_size`, which counts messages.
-- `:distribute` - `[key: column, slices: 64]` shares the scan between the producers of the
-  pipeline on every connected node. See "Distributed scans" above.
+- `:distribute` - `true`, or `[slice_rows: rows]`, shares the scan between the producers of
+  the pipeline on every connected node. See "Distributed scans" above.
 
 See `OffBroadway.Iceberg.Producer` for the full reference.
 
