@@ -10,9 +10,18 @@ the library works the way it does, and links to the official documentation where
 topic goes deeper. For the exact behavior of every option, see
 `OffBroadway.Iceberg.Producer`.
 
-The examples use a made-up table of betting events, `lake.betting.events`, as the README
-does. [Try it yourself](#try-it-yourself), at the end, runs the same ideas against a real,
-public catalog.
+We'll follow one small, fictional `lake.betting.events` table throughout the guide.
+It starts with two events:
+
+| event_id | player_id | amount |
+| --- | --- | ---: |
+| 101 | alice | 20 |
+| 102 | bob | 150 |
+
+The next commit appends event 103 (`alice`, amount 75); a later one deletes event
+102. These three rows will help us distinguish *files on disk*, *rows visible in a
+snapshot*, and *batches delivered to Broadway*. [Try it yourself](#try-it-yourself)
+uses a real public catalog instead.
 
 ## The whole picture
 
@@ -38,9 +47,10 @@ public catalog.
  Checkpoints (optional)       finished slices recorded in GCS, so a restart skips them
 ```
 
-Read it as the logical path from a table name to processed rows, not as a physical one:
-a snapshot has many manifests, and DuckDB reads metadata and data files on its own, from
-wherever they are stored.
+Read this as a map of responsibilities, **not a pipe through which every row travels**.
+The catalog and manifests describe what belongs to the table; DuckDB reads the files
+directly from storage. Checkpoints separately record Broadway's progress, rather
+than storing another copy of the data.
 
 ## What the library does
 
@@ -66,17 +76,19 @@ possible.
 ## An Iceberg table is metadata plus files
 
 An Iceberg table is neither a server nor a single file. It is a set of data files, plus
-metadata files that say which data files make up the table. No file is ever changed in
-place: a commit writes new files, then new metadata that points at them.
+metadata files that say which data files make up the table. Data files aren't edited in place: a commit adds or replaces files, then publishes
+new metadata pointing to them. Maintenance can later delete old files when no
+retained snapshot needs them.
 
 ### Data files
 
 Rows live in data files, usually [Apache Parquet](https://parquet.apache.org/docs/overview/)
 files. Parquet stores each column separately, in large groups of rows called
 [row groups](https://parquet.apache.org/docs/concepts/), and keeps statistics, such as
-each column's minimum and maximum, for every row group. A reader that needs two columns
-out of twenty, or only the rows where `amount > 100`, can skip most of a file. That
-matters in [Selecting columns and rows](#selecting-columns-and-rows).
+each column's minimum and maximum, for every row group. A reader that needs two columns out of twenty can avoid reading the other columns.
+For `amount > 100`, it **may** skip row groups whose statistics prove they hold no
+matches. How much can be skipped depends on the data and the predicate. That matters
+in [Selecting columns and rows](#selecting-columns-and-rows).
 
 A data file is the smallest piece of work this library hands out. One file can hold ten
 rows or fifty million.
@@ -100,8 +112,9 @@ catalog
 - The **metadata file** holds the schema, the partitioning, every snapshot the table
   keeps, and refs, the named pointers to snapshots such as the `main` branch.
 - A **snapshot** is the table as one commit left it. It points at a **manifest list**,
-  which lists **manifests**, which list the data files and delete files of the snapshot,
-  each with its row count and per-column statistics.
+  which lists **manifests**. Manifest entries describe data and delete files and can
+  include file-level row counts and column statistics. Parquet row groups have their
+  *own* statistics, used later while DuckDB reads the file.
 
 The catalog only holds pointers. The data files live in object storage, such as S3 or
 GCS, and DuckDB reads them from there itself.
@@ -114,16 +127,31 @@ Read more: the [Iceberg terms](https://iceberg.apache.org/terms/), and the spec'
 
 ## Snapshots: the table at one point in time
 
-Every commit makes a new snapshot:
+Each successful table change creates a new snapshot. Imagine the small events table
+is held in two Parquet files:
 
 ```text
-10:00  snapshot 1001   events-a.parquet                                  1,000 rows
-10:05  snapshot 1002   events-a.parquet, events-b.parquet                1,500 rows
-11:00  snapshot 1003   events-a.parquet, events-b.parquet, events-c...   2,300 rows
+Snapshot 1001 (10:00)                Snapshot 1002 (10:05)
+       |                                     |
+       v                                     v
+   +----------+                         +----------+
+   | File A   |------------------------>| File A   | (same physical file)
+   | 101, 102 |                         | 101, 102 |
+   +----------+                         +----------+
+                                             +
+                                             |
+                                             v
+                                        +----------+
+                                        | File B   | (newly added)
+                                        | 103      |
+                                        +----------+
 ```
 
-A snapshot is not a copy of the table. Snapshot 1002 reuses `events-a.parquet` and adds
-`events-b.parquet`: it is an inventory of files. Since files never change, snapshot 1001
+Snapshot 1001 shows events 101 and 102. Snapshot 1002 shows all three.
+File A appears twice in the diagram *only to show that both inventories refer to
+the same object*; Iceberg did not copy it.
+
+A snapshot is an inventory of files, not a copy of the table. Since files never change, snapshot 1001
 can still be read after 1002 and 1003 are committed. That lasts until a maintenance job
 [expires](https://iceberg.apache.org/docs/latest/maintenance/) old snapshots, and deletes
 the files that no remaining snapshot needs.
@@ -163,9 +191,10 @@ that say which rows of which data files are gone: by position (the third row of
 `events-a.parquet`), by value (every row whose `id` is 42), or, in format version 3, as
 deletion vectors. Readers apply them as they read.
 
-So the rows of a snapshot are not simply the rows of its data files. Reading
-`events-a.parquet` directly, with DuckDB's `read_parquet`, would return rows the table
-deleted.
+Suppose snapshot 1003 deletes event 102. File A may still physically contain that
+row, but an Iceberg-aware query over snapshot 1003 must return only events 101 and
+103. The visible rows of a snapshot aren't always the raw rows of its data files.
+Reading File A directly with DuckDB's `read_parquet` could incorrectly return 102.
 
 That is why this library never reads a data file by itself, even though it knows every
 path. Every read is a query on the Iceberg table, and DuckDB applies the delete files.
@@ -211,12 +240,31 @@ explains several things in the library:
 
 ## Files and rows: sharing a scan
 
-The library works with two units, and it helps to keep them apart:
+Imagine eight Parquet files and four workers. We want each worker to have useful
+work without forcing it to read the entire table.
 
-- **Slices are made of data files.** A distributed scan divides the snapshot's data
-  files into slices, and hands out slices.
-- **Messages are made of rows.** A slice is read as a stream of batches of up to
-  `:fetch_size` rows, and each batch is a message.
+The library works with **two different units**:
+
+- **Slices group whole data files.** A producer owns a slice, and a file isn't
+  intentionally split between slices.
+- **Broadway messages contain batches of rows.** DuckDB streams a slice's rows
+  in batches of up to `:fetch_size` rows.
+
+```text
+      Eight data files in one snapshot
+       F1 F2    F3 F4    F5 F6    F7 F8
+        \ /      \ /      \ /      \ /
+      Slice 0  Slice 1  Slice 2  Slice 3    <- distributed work
+         |
+         v            DuckDB reads this slice's files
+     [batch 1] -> [batch 2] -> ... -> [batch N]
+         |            |
+         v            v
+      Broadway     Broadway                  <- one message per batch
+```
+
+A slice can contain millions of rows without holding them all in BEAM memory:
+the producer waits for Broadway demand before fetching another batch.
 
 Planning reads only metadata. It asks the snapshot's manifests for its data files and
 their row counts, without opening any of them:
@@ -277,10 +325,14 @@ DuckDB pushes both the columns and the condition into its Iceberg scan, which
 [Try it yourself](#try-it-yourself)). The file filter stays in the inner query, so the
 condition cannot change which files a slice reads.
 
-What the condition does not do yet is shape the plan. Slices are still made from every
-data file of the snapshot, so the files of a slice that holds no matching rows are still
-opened, and the slice emits no messages. Using the manifests' statistics to leave such
-files out at planning time is a possible next step.
+For our little example, `where: {"amount > ?", [100]}` selects only event 102 in
+snapshot 1002. Selecting `columns: ["event_id", "amount"]` would deliver those
+two columns, not `player_id`.
+
+The predicate does **not** yet shape the *slice plan*: every data file is considered
+during planning, even when a slice will produce no matching rows. DuckDB may still
+skip physical reads when the predicate and statistics allow it. Pruning irrelevant
+files *during planning* would be a separate improvement.
 
 > #### The condition must not change {: .warning}
 >
@@ -312,6 +364,24 @@ gs://my-checkpoints/iceberg/jobs/events-backfill-2026-11/job.json
 gs://my-checkpoints/iceberg/jobs/events-backfill-2026-11/slices/000000.json
 gs://my-checkpoints/iceberg/jobs/events-backfill-2026-11/slices/000003.json
 ```
+
+The crucial ordering is **acknowledge first, persist second, announce third**:
+
+```text
+DuckDB           Producer              Broadway                GCS
+   |                |                       |                    |
+   |-- batch ------>|-- message ---------->|                    |
+   |                |<-- successful ack ----|                    |
+   |-- end slice -->|                       |                    |
+   |                |-- create checkpoint ---------------------->|
+   |                |<--------------------------- confirmed -----|
+   |                |
+   |                +-- announce durable completion to peers
+```
+
+If the producer crashes after processing rows but before GCS confirms the
+checkpoint, the next run may replay the slice. That is why downstream writes
+must be idempotent. Failed batches never produce successful checkpoints.
 
 Every object is created with a
 [precondition](https://cloud.google.com/storage/docs/request-preconditions),
@@ -369,8 +439,9 @@ ATTACH 'commons/pubdata' AS pubdata
   (TYPE iceberg, URI 'https://public-catalog.lakehousebox.com', AUTHORIZATION_TYPE 'none');
 ```
 
-The snapshots of a table, and what each commit did. At the time of writing, a daily job
-replaces this table's data, so each day adds a `delete` snapshot and an `append` one:
+First, inspect the snapshot history. Observe the `snapshot_id` and `operation`
+columns: they reveal which table versions exist and what kind of change created
+each one. The public table changes over time, so your results may differ:
 
 ```sql
 SELECT snapshot_id, parent_id, operation, timestamp_ms
@@ -380,8 +451,9 @@ ORDER BY sequence_number;
 SELECT name, snapshot_id FROM iceberg_refs('pubdata.environment.earthquakes');
 ```
 
-The data files of the current snapshot, as planning sees them, and those of an older one.
-Pick an `append` snapshot from the list above:
+Next, inspect the file inventory that the library uses to plan slices. For the
+second query, replace the illustrative `1002` with a real, retained snapshot ID
+from your first query:
 
 ```sql
 SELECT file_path, record_count
@@ -389,19 +461,22 @@ FROM iceberg_files('pubdata.environment.earthquakes')
 WHERE content = 0;
 
 SELECT file_path, record_count
-FROM iceberg_files('pubdata.environment.earthquakes', snapshot_from_id => ⟨older_snapshot_id⟩)
+FROM iceberg_files('pubdata.environment.earthquakes', snapshot_from_id => 1002)
 WHERE content = 0;
 ```
 
-Time travel. The older snapshot still has its own file, and its own row count:
+Then compare the current table with that earlier snapshot (again, replace `1002`).
+Counts may differ after appends or deletes, but compaction can replace files
+without changing the row count:
 
 ```sql
 SELECT count(*) FROM pubdata.environment.earthquakes;
-SELECT count(*) FROM pubdata.environment.earthquakes AT (VERSION => ⟨older_snapshot_id⟩);
+SELECT count(*) FROM pubdata.environment.earthquakes AT (VERSION => 1002);
 ```
 
-Pushdown. In the plan, the `ICEBERG_SCAN` reads only `magnitude` and `event_time`, and
-applies `magnitude >= 7.5` itself:
+Finally, inspect the query plan. Look for `ICEBERG_SCAN`: its projections should
+contain only `magnitude` and `event_time`, and its filter should contain
+`magnitude >= 7.5`:
 
 ```sql
 EXPLAIN
