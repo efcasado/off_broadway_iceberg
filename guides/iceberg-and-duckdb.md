@@ -26,23 +26,46 @@ uses a real public catalog instead.
 ## The whole picture
 
 ```mermaid
-flowchart TB
-    C["Iceberg REST catalog<br/>resolves lake.betting.events"]
-    M["Table metadata<br/>schema, branches and snapshots"]
-    S["Pinned snapshot 1002"]
-    L["Manifest list and manifests<br/>file inventory and statistics"]
-    F["Data and delete files<br/>in object storage"]
-    D["DuckDB + Iceberg extension<br/>reads selected rows, applies deletes"]
-    Q["QuackDB<br/>streams bounded batches"]
-    B["Broadway<br/>processes and acknowledges batches"]
-    G["GCS checkpoints<br/>durable completion per slice"]
+flowchart LR
+    subgraph Iceberg["ICEBERG · table metadata"]
+        direction TB
+        C["REST catalog<br/>lake.betting.events"]
+        M["Table metadata<br/>schema and references"]
+        S["Snapshot 1002"]
+        L["Manifests<br/>file inventory"]
+        C --> M --> S --> L
+    end
 
-    C --> M --> S --> L
-    L -->|identifies files| F
-    F -->|read by| D
-    S -.->|select snapshot| D
-    D --> Q --> B
-    B -.->|after successful acknowledgements| G
+    subgraph Storage["OBJECT STORAGE"]
+        F[("Data + delete files")]
+    end
+
+    subgraph Pipeline["QUERY + PROCESSING"]
+        direction TB
+        D["DuckDB<br/>Iceberg-aware SQL"]
+        Q["QuackDB<br/>bounded batches"]
+        B["Broadway<br/>process and acknowledge"]
+        D --> Q --> B
+    end
+
+    G[("GCS checkpoints<br/>completed slices")]
+
+    L -->|identifies| F
+    F -->|reads| D
+    S -.->|pins version| D
+    B -.->|successful slices| G
+
+    classDef catalog fill:#eaf1ff,stroke:#5275bd,color:#203965,stroke-width:1.5px
+    classDef files fill:#e7f5ed,stroke:#378263,color:#174b38,stroke-width:1.5px
+    classDef compute fill:#f2edff,stroke:#8066bb,color:#42316c,stroke-width:1.5px
+    classDef durable fill:#fff0db,stroke:#b98539,color:#68420d,stroke-width:1.5px
+    class C,M,S,L catalog
+    class F files
+    class D,Q,B compute
+    class G durable
+    style Iceberg fill:#5275bd0c,stroke:#9aadd0,stroke-width:1px
+    style Storage fill:#3782630c,stroke:#92bca9,stroke-width:1px
+    style Pipeline fill:#8066bb0c,stroke:#b3a5d4,stroke-width:1px
 ```
 
 Read this as a map of responsibilities, **not a pipe through which every row travels**.
@@ -120,14 +143,28 @@ is held in two Parquet files:
 
 ```mermaid
 flowchart TB
-    S1["Snapshot 1001<br/>10:00"]
-    S2["Snapshot 1002<br/>10:05"]
-    A["File A<br/>events 101 and 102"]
-    B["File B<br/>event 103"]
-
+    subgraph Versions["Snapshots · metadata references"]
+        direction LR
+        S1["Snapshot 1001<br/>10:00"]
+        S2["Snapshot 1002<br/>10:05"]
+    end
+    subgraph Objects["Immutable data files"]
+        direction LR
+        A[("File A<br/>events 101, 102")]
+        B[("File B<br/>event 103")]
+    end
     S1 --> A
     S2 --> A
-    S2 --> B
+    S2 -->|new file| B
+
+    classDef snapshot fill:#eaf1ff,stroke:#5275bd,color:#203965,stroke-width:1.6px
+    classDef existing fill:#e7f5ed,stroke:#378263,color:#174b38,stroke-width:1.6px
+    classDef added fill:#fff0db,stroke:#b98539,color:#68420d,stroke-width:1.6px
+    class S1,S2 snapshot
+    class A existing
+    class B added
+    style Versions fill:#5275bd0c,stroke:#9aadd0
+    style Objects fill:#3782630c,stroke:#92bca9
 ```
 
 Snapshot 1001 shows events 101 and 102. Snapshot 1002 shows all three.
@@ -234,31 +271,28 @@ The library works with **two different units**:
 
 ```mermaid
 flowchart TB
-    subgraph Files["Eight Iceberg data files"]
+    subgraph Slices["Distributed slices · whole files"]
         direction LR
-        F1["F1, F2"]
-        F2["F3, F4"]
-        F3["F5, F6"]
-        F4["F7, F8"]
+        S0["Slice 0<br/>F1 + F2"]
+        S1["Slice 1<br/>F3 + F4"]
+        S2["Slice 2<br/>F5 + F6"]
+        S3["Slice 3<br/>F7 + F8"]
     end
-    subgraph Work["Distributed slices"]
-        direction LR
-        S0["Slice 0"]
-        S1["Slice 1"]
-        S2["Slice 2"]
-        S3["Slice 3"]
-    end
-    F1 --> S0
-    F2 --> S1
-    F3 --> S2
-    F4 --> S3
-    S0 --> D["DuckDB reads this slice's files"]
-    D --> B1["Batch 1"]
-    D --> B2["Batch 2"]
-    D --> BN["Batch N"]
-    B1 --> P["Broadway processors"]
-    B2 --> P
-    BN --> P
+
+    S0 --> D["DuckDB<br/>reads Slice 0"]
+    D --> B["Streaming row batches<br/>1, 2, …, N"]
+    B --> P["Broadway<br/>one message per batch"]
+    S1 -.->|independent work| D
+    S2 -.->|independent work| D
+    S3 -.->|independent work| D
+
+    classDef slice fill:#e7f5ed,stroke:#378263,color:#174b38,stroke-width:1.5px
+    classDef stream fill:#eaf1ff,stroke:#5275bd,color:#203965,stroke-width:1.5px
+    classDef process fill:#f2edff,stroke:#8066bb,color:#42316c,stroke-width:1.5px
+    class S0,S1,S2,S3 slice
+    class D,B stream
+    class P process
+    style Slices fill:#3782630c,stroke:#92bca9
 ```
 
 A slice can contain millions of rows without holding them all in BEAM memory:
@@ -367,21 +401,28 @@ The crucial ordering is **acknowledge first, persist second, announce third**:
 
 ```mermaid
 sequenceDiagram
+    autonumber
     participant D as DuckDB
     participant P as Producer
     participant B as Broadway
     participant G as GCS
-    participant Peers as Other producers
+    participant O as Peers
 
-    D->>P: Rows in batches
-    P->>B: Broadway messages
-    B-->>P: Successful acknowledgements
-    D-->>P: End of slice
-    Note over P: All batches acknowledged
-    P->>G: Create slice checkpoint
-    G-->>P: Confirmed durable
-    P-->>Peers: Announce slice completed
-    Note over P,G: Crash before confirmation may cause replay
+    rect rgb(235, 241, 255)
+        D->>P: Read rows in batches
+        P->>B: Emit batch messages
+        B-->>P: Acknowledge all batches
+        D-->>P: End of slice
+    end
+
+    rect rgb(231, 245, 237)
+        Note over P: Fully processed slice
+        P->>G: Create checkpoint
+        G-->>P: Durable confirmation
+        P-->>O: Announce completion
+    end
+
+    Note over P,G: Crash before confirmation?<br/>The next run may replay this slice.
 ```
 
 If the producer crashes after processing rows but before GCS confirms the
@@ -409,14 +450,35 @@ snapshots, and it is not a stream of changes.
 New files between two snapshots are not the same as new rows:
 
 ```mermaid
-flowchart TB
-    S2["Snapshot 1002"] --> A["File A"]
-    S2 --> B["File B"]
-    S3["Snapshot 1003<br/>append"] --> A
+flowchart LR
+    subgraph History["Snapshot history"]
+        direction TB
+        S2["1002 · initial"]
+        S3["1003 · append"]
+        S4["1004 · compact"]
+    end
+    A[("File A")]
+    B[("File B")]
+    C[("File C<br/>new rows")]
+    BC[("File BC<br/>same rows as B + C")]
+
+    S2 --> A
+    S2 --> B
+    S3 --> A
     S3 --> B
-    S3 --> C["File C<br/>new rows"]
-    S4["Snapshot 1004<br/>compaction"] --> A
-    S4 --> BC["File BC<br/>same rows as B + C"]
+    S3 -->|append| C
+    S4 --> A
+    S4 -->|rewritten, not new rows| BC
+
+    classDef snapshot fill:#eaf1ff,stroke:#5275bd,color:#203965,stroke-width:1.5px
+    classDef existing fill:#e7f5ed,stroke:#378263,color:#174b38,stroke-width:1.5px
+    classDef newfile fill:#fff0db,stroke:#b98539,color:#68420d,stroke-width:1.5px
+    classDef compacted fill:#f2edff,stroke:#8066bb,color:#42316c,stroke-width:1.5px
+    class S2,S3,S4 snapshot
+    class A,B existing
+    class C newfile
+    class BC compacted
+    style History fill:#5275bd0c,stroke:#9aadd0
 ```
 
 Between 1003 and 1004, a new file appeared, but no row is new: reading "the files added since
