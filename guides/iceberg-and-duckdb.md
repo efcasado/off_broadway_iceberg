@@ -25,26 +25,24 @@ uses a real public catalog instead.
 
 ## The whole picture
 
-```text
- Iceberg REST catalog         "lake.betting.events" -> its current metadata file
-          |
- Table metadata               schema, snapshots, and branches such as main
-          |
- Snapshot 1002                the table as one commit left it
-          |
- Manifest list -> manifests   which files make up the snapshot, with row counts
-          |                   and column statistics
-          |
- Data files + delete files    Parquet files in object storage
-          |
- DuckDB + iceberg extension   runs SQL on the pinned snapshot, applying deletes,
-          |                   reading only the columns and rows asked for
-          |
- QuackDB -> Broadway          one batch of rows per unit of demand
-          |
- Acknowledgements             a slice is finished once all its batches are processed
-          |
- Checkpoints (optional)       finished slices recorded in GCS, so a restart skips them
+```mermaid
+flowchart TB
+    C["Iceberg REST catalog<br/>resolves lake.betting.events"]
+    M["Table metadata<br/>schema, branches and snapshots"]
+    S["Pinned snapshot 1002"]
+    L["Manifest list and manifests<br/>file inventory and statistics"]
+    F["Data and delete files<br/>in object storage"]
+    D["DuckDB + Iceberg extension<br/>reads selected rows, applies deletes"]
+    Q["QuackDB<br/>streams bounded batches"]
+    B["Broadway<br/>processes and acknowledges batches"]
+    G["GCS checkpoints<br/>durable completion per slice"]
+
+    C --> M --> S --> L
+    L -->|identifies files| F
+    F -->|read by| D
+    S -.->|select snapshot| D
+    D --> Q --> B
+    B -.->|after successful acknowledgements| G
 ```
 
 Read this as a map of responsibilities, **not a pipe through which every row travels**.
@@ -95,16 +93,6 @@ rows or fifty million.
 
 ### Metadata
 
-```text
-catalog
-  "lake.betting.events" -> metadata file
-                             schema, partitioning, snapshots, refs (main -> 1002)
-                             snapshot 1002 -> manifest list
-                                                manifest -> events-a.parquet (1,000 rows)
-                                                            events-b.parquet (  500 rows)
-                                                manifest -> a delete file
-```
-
 - The **catalog** maps a table's name to its current metadata file. A commit swaps that
   pointer in one atomic step, so readers see either the old table or the new one. This
   library reads tables of a catalog DuckDB attaches, usually an
@@ -130,29 +118,23 @@ Read more: the [Iceberg terms](https://iceberg.apache.org/terms/), and the spec'
 Each successful table change creates a new snapshot. Imagine the small events table
 is held in two Parquet files:
 
-```text
-Snapshot 1001 (10:00)                Snapshot 1002 (10:05)
-       |                                     |
-       v                                     v
-   +----------+                         +----------+
-   | File A   |------------------------>| File A   | (same physical file)
-   | 101, 102 |                         | 101, 102 |
-   +----------+                         +----------+
-                                             +
-                                             |
-                                             v
-                                        +----------+
-                                        | File B   | (newly added)
-                                        | 103      |
-                                        +----------+
+```mermaid
+flowchart TB
+    S1["Snapshot 1001<br/>10:00"]
+    S2["Snapshot 1002<br/>10:05"]
+    A["File A<br/>events 101 and 102"]
+    B["File B<br/>event 103"]
+
+    S1 --> A
+    S2 --> A
+    S2 --> B
 ```
 
 Snapshot 1001 shows events 101 and 102. Snapshot 1002 shows all three.
-File A appears twice in the diagram *only to show that both inventories refer to
-the same object*; Iceberg did not copy it.
+Both snapshots point to **the same physical File A**; Iceberg did not copy it.
 
-A snapshot is an inventory of files, not a copy of the table. Since files never change, snapshot 1001
-can still be read after 1002 and 1003 are committed. That lasts until a maintenance job
+A snapshot is an inventory of files, not a copy of the table. Because its data files
+are immutable, snapshot 1001 can still be read after 1002 and 1003 are committed. That lasts until a maintenance job
 [expires](https://iceberg.apache.org/docs/latest/maintenance/) old snapshots, and deletes
 the files that no remaining snapshot needs.
 
@@ -250,17 +232,33 @@ The library works with **two different units**:
 - **Broadway messages contain batches of rows.** DuckDB streams a slice's rows
   in batches of up to `:fetch_size` rows.
 
-```text
-      Eight data files in one snapshot
-       F1 F2    F3 F4    F5 F6    F7 F8
-        \ /      \ /      \ /      \ /
-      Slice 0  Slice 1  Slice 2  Slice 3    <- distributed work
-         |
-         v            DuckDB reads this slice's files
-     [batch 1] -> [batch 2] -> ... -> [batch N]
-         |            |
-         v            v
-      Broadway     Broadway                  <- one message per batch
+```mermaid
+flowchart TB
+    subgraph Files["Eight Iceberg data files"]
+        direction LR
+        F1["F1, F2"]
+        F2["F3, F4"]
+        F3["F5, F6"]
+        F4["F7, F8"]
+    end
+    subgraph Work["Distributed slices"]
+        direction LR
+        S0["Slice 0"]
+        S1["Slice 1"]
+        S2["Slice 2"]
+        S3["Slice 3"]
+    end
+    F1 --> S0
+    F2 --> S1
+    F3 --> S2
+    F4 --> S3
+    S0 --> D["DuckDB reads this slice's files"]
+    D --> B1["Batch 1"]
+    D --> B2["Batch 2"]
+    D --> BN["Batch N"]
+    B1 --> P["Broadway processors"]
+    B2 --> P
+    BN --> P
 ```
 
 A slice can contain millions of rows without holding them all in BEAM memory:
@@ -367,16 +365,23 @@ gs://my-checkpoints/iceberg/jobs/events-backfill-2026-11/slices/000003.json
 
 The crucial ordering is **acknowledge first, persist second, announce third**:
 
-```text
-DuckDB           Producer              Broadway                GCS
-   |                |                       |                    |
-   |-- batch ------>|-- message ---------->|                    |
-   |                |<-- successful ack ----|                    |
-   |-- end slice -->|                       |                    |
-   |                |-- create checkpoint ---------------------->|
-   |                |<--------------------------- confirmed -----|
-   |                |
-   |                +-- announce durable completion to peers
+```mermaid
+sequenceDiagram
+    participant D as DuckDB
+    participant P as Producer
+    participant B as Broadway
+    participant G as GCS
+    participant Peers as Other producers
+
+    D->>P: Rows in batches
+    P->>B: Broadway messages
+    B-->>P: Successful acknowledgements
+    D-->>P: End of slice
+    Note over P: All batches acknowledged
+    P->>G: Create slice checkpoint
+    G-->>P: Confirmed durable
+    P-->>Peers: Announce slice completed
+    Note over P,G: Crash before confirmation may cause replay
 ```
 
 If the producer crashes after processing rows but before GCS confirms the
@@ -403,14 +408,18 @@ snapshots, and it is not a stream of changes.
 
 New files between two snapshots are not the same as new rows:
 
-```text
-snapshot 1002   events-a, events-b
-snapshot 1003   events-a, events-b, events-c     append: events-c holds new rows
-snapshot 1004   events-a, events-bc              replace: compaction merged events-b and
-                                                 events-c into events-bc, no row changed
+```mermaid
+flowchart TB
+    S2["Snapshot 1002"] --> A["File A"]
+    S2 --> B["File B"]
+    S3["Snapshot 1003<br/>append"] --> A
+    S3 --> B
+    S3 --> C["File C<br/>new rows"]
+    S4["Snapshot 1004<br/>compaction"] --> A
+    S4 --> BC["File BC<br/>same rows as B + C"]
 ```
 
-Between 1003 and 1004, a file appeared, but no row is new: reading "the files added since
+Between 1003 and 1004, a new file appeared, but no row is new: reading "the files added since
 1003" would deliver the rows of `events-b` and `events-c` again. Iceberg records what each
 commit did, in the `operation` of its snapshot: `append`, `replace`, `overwrite` or
 `delete`. Telling new rows apart starts there, and the library does not do it yet. To
