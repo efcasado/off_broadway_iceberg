@@ -22,9 +22,9 @@ defmodule OffBroadway.Iceberg.Test.Member do
   ]
 
   @doc """
-  Starts the member, tagging what it forwards with `tag`. Options: `:rows`, `:demand`
-  (default 1_000), and the producer's `:table`, `:snapshot_id`, `:fetch_size` and
-  `:distribute`.
+  Starts the member, tagging what it forwards with `tag`. Options: `:files`, the data
+  files of the fake database, `:demand` (default 1_000), and the producer's `:table`,
+  `:snapshot_id`, `:fetch_size` and `:distribute`.
   """
   def start(test, tag, opts) do
     owner = self()
@@ -36,7 +36,7 @@ defmodule OffBroadway.Iceberg.Test.Member do
         id = {__MODULE__, tag}
         :telemetry.attach_many(id, @events, &Telemetry.handle_event/4, {test, &(&1.table == table)})
 
-        {:ok, pool} = FakeConnection.start_link(test: test, script: [rows: Keyword.fetch!(opts, :rows)], pool_size: 1)
+        {:ok, pool} = FakeConnection.start_link(test: test, script: [files: Keyword.fetch!(opts, :files)], pool_size: 1)
         producer_opts = Keyword.take(opts, [:table, :snapshot_id, :fetch_size, :distribute])
         {:ok, producer} = GenStage.start_link(Producer, [connection: pool] ++ producer_opts)
         {:ok, consumer} = ManualConsumer.start_link(producer, test: test, tag: tag, ack: true)

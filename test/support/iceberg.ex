@@ -17,6 +17,8 @@ defmodule OffBroadway.Iceberg.Test.Iceberg do
   Starts the REST catalog with an empty warehouse under `tmp/`.
   """
   def start_catalog! do
+    # A catalog left running by an earlier run would keep the warehouse it had mounted.
+    compose!(["down", "--volumes"])
     warehouse = warehouse()
     File.rm_rf!(warehouse)
     File.mkdir_p!(warehouse)

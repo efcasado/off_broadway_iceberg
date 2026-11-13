@@ -11,10 +11,13 @@ defmodule OffBroadway.Iceberg.DistributionTest do
   # DBConnection logs the disconnects that cancelled scans cause.
   @moduletag :capture_log
 
+  # 32 data files of 10 rows. With a slice of 10 rows, each file is a slice, and with 5
+  # rows per message, each slice makes 2 messages.
   @slices 32
   @rows 320
-  # 10 rows per slice and 5 rows per message make 2 messages per slice.
   @batches 64
+  @files for file <- 0..(@slices - 1),
+             do: {"file-#{String.pad_leading("#{file}", 2, "0")}", Enum.map((file * 10)..(file * 10 + 9), &[&1])}
 
   describe "ownership" do
     test "does not depend on the order members are listed in" do
@@ -38,37 +41,36 @@ defmodule OffBroadway.Iceberg.DistributionTest do
   describe "options" do
     test "require a snapshot every node resolves the same way" do
       assert_raise ArgumentError, ~r/requires an integer or \{:as_of, datetime\} :snapshot_id with :distribute/, fn ->
-        prepare(connection: MyApp.QuackDB, table: "events", distribute: [key: "id"])
+        prepare(connection: MyApp.QuackDB, table: "events", distribute: true)
       end
 
-      assert {[], _opts} = prepare(connection: MyApp.QuackDB, table: "events", snapshot_id: 7, distribute: [key: "id"])
+      assert {[], _opts} = prepare(connection: MyApp.QuackDB, table: "events", snapshot_id: 7, distribute: true)
 
       assert {[], _opts} =
                prepare(
                  connection: MyApp.QuackDB,
                  table: "events",
                  snapshot_id: {:as_of, DateTime.utc_now()},
-                 distribute: [key: ["id", "odd \"name\""], slices: 8]
+                 distribute: [slice_rows: 100]
                )
     end
 
-    test "reject keys that are not column names" do
-      for key <- ["", [], [""], :id, ["id", 1], ["a" <> <<0>>]] do
-        assert_raise NimbleOptions.ValidationError, ~r/:key/, fn ->
-          prepare(connection: MyApp.QuackDB, table: "events", snapshot_id: 7, distribute: [key: key])
+    test "reject anything but true or a positive :slice_rows" do
+      for distribute <- [[slice_rows: 0], [slice_rows: "10"], [slices: 4], :yes] do
+        assert_raise NimbleOptions.ValidationError, ~r/:distribute/, fn ->
+          prepare(connection: MyApp.QuackDB, table: "events", snapshot_id: 7, distribute: distribute)
         end
       end
     end
 
     test "allow more than one producer stage" do
-      opts = [connection: MyApp.QuackDB, table: "events", snapshot_id: 7, distribute: [key: "id"]]
-      assert {[], _opts} = prepare(opts, 4)
+      assert {[], _opts} = prepare([connection: MyApp.QuackDB, table: "events", snapshot_id: 7, distribute: true], 4)
     end
   end
 
   describe "snapshots" do
     test "{:as_of, datetime} resolves through the snapshot log, in UTC" do
-      pool = start_pool(rows: rows(10))
+      pool = start_pool(rows: [[1]])
       table = unique_table()
 
       as_of = %DateTime{
@@ -94,9 +96,67 @@ defmodule OffBroadway.Iceberg.DistributionTest do
     end
   end
 
+  describe "planning" do
+    test "groups small data files into slices of at least :slice_rows rows" do
+      pool = start_pool(files: Enum.take(@files, 10))
+      table = unique_table()
+      Telemetry.attach_scan(table)
+
+      %{consumer: consumer} = start_member(pool, table, :a, distribute: [slice_rows: 25])
+      ManualConsumer.ask(consumer, 1_000)
+
+      assert_receive {:telemetry, [:off_broadway_iceberg, :scan, :stop], %{rows: 100}, _}, 5_000
+
+      assert_received {:fake,
+                       {:query, "SELECT file_path, record_count FROM iceberg_files(?, snapshot_from_id => ?)" <> _,
+                        [_, 42]}}
+
+      declared = for {:fake, {:declare, _statement, [42 | paths], 5}} <- flush(), do: paths
+
+      assert Enum.sort(declared) == [
+               ~w(file-00 file-01 file-02),
+               ~w(file-03 file-04 file-05),
+               ~w(file-06 file-07 file-08),
+               ~w(file-09)
+             ]
+    end
+
+    test "reads each slice by its files' names" do
+      pool = start_pool(files: Enum.take(@files, 1))
+      table = unique_table()
+
+      %{consumer: consumer} = start_member(pool, table, :a)
+      ManualConsumer.ask(consumer, 1)
+
+      assert_receive {:fake, {:declare, statement, [42, "file-00"], 5}}
+      assert statement == ~s|SELECT * FROM "#{table}" AT (VERSION => ?) WHERE filename IN (?)|
+    end
+
+    test "a snapshot without data files completes at once" do
+      pool = start_pool(files: [])
+      table = unique_table()
+      Telemetry.attach_scan(table)
+
+      start_member(pool, table, :a)
+
+      assert_receive {:telemetry, [:off_broadway_iceberg, :scan, :stop], %{rows: 0, batches: 0}, _}
+    end
+
+    test "a plan that fails fails the scan" do
+      error = %QuackDB.Error{message: "IO Error: catalog unreachable"}
+      pool = start_pool(files: @files, fail: {:plan, error})
+      table = unique_table()
+      Telemetry.attach_scan(table)
+
+      start_member(pool, table, :a)
+
+      assert_receive {:telemetry, [:off_broadway_iceberg, :scan, :exception], _, %{reason: ^error, snapshot_id: nil}}
+    end
+  end
+
   describe "a distributed scan" do
     test "is not reported complete while this producer's messages are still being processed" do
-      pool = start_pool(rows: rows(@rows))
+      pool = start_pool(files: @files)
       table = unique_table()
       name = :"pipeline_#{System.unique_integer([:positive])}"
       Telemetry.attach_scan(table)
@@ -115,14 +175,7 @@ defmodule OffBroadway.Iceberg.DistributionTest do
         message
       end
 
-      producer = [
-        connection: pool,
-        table: table,
-        snapshot_id: 42,
-        fetch_size: 5,
-        distribute: [key: "id", slices: @slices]
-      ]
-
+      producer = [connection: pool, table: table, snapshot_id: 42, fetch_size: 5, distribute: [slice_rows: 10]]
       start_supervised!({Pipeline, name: name, handler: handler, producer: producer})
       assert_receive {:blocked, processor}
 
@@ -140,7 +193,7 @@ defmodule OffBroadway.Iceberg.DistributionTest do
     end
 
     test "is shared by its producers, which all report the whole scan" do
-      pool = start_pool(rows: rows(@rows), pool_size: 4)
+      pool = start_pool(files: @files, pool_size: 4)
       table = unique_table()
       Telemetry.attach_scan(table)
 
@@ -160,16 +213,14 @@ defmodule OffBroadway.Iceberg.DistributionTest do
       # Only a slice a producer started before the other joined can be read twice.
       assert length(a) + length(b) < 2 * @batches, "each producer read the whole scan"
 
+      # Slice i is file i, which holds the rows 10 * i to 10 * i + 9.
       for message <- a ++ b, id <- QuackDB.Columns.get(message.data, "id") do
-        assert rem(id, @slices) == message.metadata.slice
+        assert div(id, 10) == message.metadata.slice
       end
-
-      assert_received {:fake, {:declare, statement, [42, @slices, _slice], 5}}
-      assert statement =~ ~r/ AT \(VERSION => \?\) WHERE hash\("id"\) % \? = \?$/
     end
 
     test "is reported complete to a producer that joins after it ends, which reads nothing" do
-      pool = start_pool(rows: rows(@rows), pool_size: 4)
+      pool = start_pool(files: @files, pool_size: 4)
       table = unique_table()
       Telemetry.attach_scan(table)
 
@@ -184,7 +235,7 @@ defmodule OffBroadway.Iceberg.DistributionTest do
     end
 
     test "survives a producer that stops mid-scan, whose slices others read" do
-      pool = start_pool(rows: rows(@rows), pool_size: 4)
+      pool = start_pool(files: @files, pool_size: 4)
       table = unique_table()
       Telemetry.attach_scan(table)
 
@@ -204,8 +255,8 @@ defmodule OffBroadway.Iceberg.DistributionTest do
 
     test "survives a producer that fails, whose slices others read" do
       error = %QuackDB.Error{message: "IO Error: connection reset"}
-      healthy = start_pool(rows: rows(@rows), pool_size: 2)
-      failing = start_pool([rows: rows(@rows), fail: {:declare, error}], id: :failing)
+      healthy = start_pool(files: @files, pool_size: 2)
+      failing = start_pool([files: @files, fail: {:declare, error}], id: :failing)
       table = unique_table()
       Telemetry.attach_scan(table)
 
@@ -234,14 +285,12 @@ defmodule OffBroadway.Iceberg.DistributionTest do
 
   # A producer of the scan, and a consumer that acknowledges every message and forwards
   # it to the test as `{:messages, id, messages}`.
-  defp start_member(pool, table, id) do
-    opts = [
-      connection: pool,
-      table: table,
-      snapshot_id: 42,
-      fetch_size: 5,
-      distribute: [key: "id", slices: @slices]
-    ]
+  defp start_member(pool, table, id, opts \\ []) do
+    opts =
+      Keyword.merge(
+        [connection: pool, table: table, snapshot_id: 42, fetch_size: 5, distribute: [slice_rows: 10]],
+        opts
+      )
 
     producer = start_supervised!({Producer, opts}, id: id)
     {:ok, consumer} = ManualConsumer.start_link(producer, tag: id, ack: true)
@@ -256,9 +305,15 @@ defmodule OffBroadway.Iceberg.DistributionTest do
     end
   end
 
-  defp ids(messages), do: Enum.flat_map(messages, &QuackDB.Columns.get(&1.data, "id"))
+  defp flush(messages \\ []) do
+    receive do
+      message -> flush([message | messages])
+    after
+      0 -> Enum.reverse(messages)
+    end
+  end
 
-  defp rows(count), do: Enum.map(0..(count - 1)//1, &[&1])
+  defp ids(messages), do: Enum.flat_map(messages, &QuackDB.Columns.get(&1.data, "id"))
 
   defp unique_table, do: "events_#{System.unique_integer([:positive])}"
 end

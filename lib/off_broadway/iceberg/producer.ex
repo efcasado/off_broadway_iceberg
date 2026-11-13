@@ -29,6 +29,7 @@ defmodule OffBroadway.Iceberg.Producer do
   require Logger
 
   @max_snapshot_id 0x7FFFFFFFFFFFFFFF
+  @slice_rows 1_000_000
 
   @opts_schema [
     connection: [
@@ -71,23 +72,14 @@ defmodule OffBroadway.Iceberg.Producer do
       """
     ],
     distribute: [
-      type: :keyword_list,
-      keys: [
-        key: [
-          type: {:custom, __MODULE__, :validate_key, []},
-          required: true,
-          doc: "The column, or list of columns, that rows are assigned to slices by."
-        ],
-        slices: [
-          type: :pos_integer,
-          default: 64,
-          doc: "The number of slices the snapshot is divided into."
-        ]
-      ],
+      type: {:or, [:boolean, :keyword_list]},
+      default: false,
       doc: """
       Shares the scan between the producers of this pipeline on every connected node.
-      See "Distributed scans" below. Requires an integer or `{:as_of, datetime}`
-      `:snapshot_id`.
+      `true`, or `[slice_rows: rows]` to set how many rows a slice holds at least (default
+      `#{@slice_rows}`): small data files are grouped into slices of that many rows, and
+      larger files make a slice each. See "Distributed scans" below. Requires an integer
+      or `{:as_of, datetime}` `:snapshot_id`.
       """
     ]
   ]
@@ -339,16 +331,21 @@ defmodule OffBroadway.Iceberg.Producer do
       reads: %{},
       emitted: 0,
       rows: 0,
-      # A scan without :distribute is a single slice that only this producer reads.
-      key: nil,
-      slices: 1,
+      # A scan without :distribute is a single slice that only this producer reads. A
+      # distributed one has as many slices as its plan, and joins its group once planned.
+      distributed?: distribute != nil,
+      slices: if(distribute, do: nil, else: 1),
+      units: nil,
+      planner: nil,
       group: nil,
       monitor: nil,
       members: [self()],
       done: %{}
     }
 
-    {:producer, state |> join(distribute) |> next_slice()}
+    state = if distribute, do: plan(state, distribute), else: state
+
+    {:producer, next_slice(state)}
   end
 
   @impl GenStage
@@ -364,7 +361,7 @@ defmodule OffBroadway.Iceberg.Producer do
   def handle_info({Scan, ref, {:batch, batch}}, %{scan: %{ref: ref, slice: slice}} = state) do
     read = Map.fetch!(state.reads, ref)
     metadata = %{table: state.table, snapshot_id: state.snapshot_id, batch_index: read.emitted}
-    metadata = if state.group, do: Map.put(metadata, :slice, slice), else: metadata
+    metadata = if state.distributed?, do: Map.put(metadata, :slice, slice), else: metadata
 
     message = %Message{
       data: batch,
@@ -394,18 +391,17 @@ defmodule OffBroadway.Iceberg.Producer do
   end
 
   def handle_info({Scan, ref, {:error, reason}}, %{scan: %{ref: ref, slice: slice}} = state) do
-    Logger.error(
-      "Scan of #{describe(state, slice)} failed after #{state.emitted} batches and will not be " <>
-        "retried#{if state.group, do: " by this producer", else: ""}: #{format_reason(reason)}"
-    )
+    {:noreply, [], fail(%{state | scan: nil, requested: 0}, describe(state, slice), reason)}
+  end
 
-    :telemetry.execute(
-      [:off_broadway_iceberg, :scan, :exception],
-      %{duration: duration(state), batches: state.emitted, rows: state.rows},
-      Map.merge(event_metadata(state), %{kind: :error, reason: reason})
-    )
+  def handle_info({Scan, ref, {:plan, snapshot_id, units}}, %{planner: %{ref: ref}} = state) do
+    state = %{state | planner: nil, units: List.to_tuple(units), slices: length(units)}
 
-    {:noreply, [], leave(%{state | scan: nil, requested: 0, status: :failed})}
+    {:noreply, [], state |> start_scan(snapshot_id) |> join() |> next_slice() |> maybe_complete()}
+  end
+
+  def handle_info({Scan, ref, {:error, reason}}, %{planner: %{ref: ref}} = state) do
+    {:noreply, [], fail(%{state | planner: nil}, "the plan of #{inspect(state.table)}", reason)}
   end
 
   # A worker that was stopped may have sent messages before it stopped.
@@ -456,7 +452,7 @@ defmodule OffBroadway.Iceberg.Producer do
   # A distributed producer also leaves its group, so the others take its slices over.
   @impl Broadway.Producer
   def prepare_for_draining(%{status: :running} = state) do
-    {:noreply, [], state |> stop_scan() |> leave() |> Map.put(:status, :cancelled)}
+    {:noreply, [], state |> stop_planner() |> stop_scan() |> leave() |> Map.put(:status, :cancelled)}
   end
 
   def prepare_for_draining(state), do: {:noreply, [], state}
@@ -465,7 +461,7 @@ defmodule OffBroadway.Iceberg.Producer do
   # propagate through a link, so stop the worker explicitly.
   @impl GenStage
   def terminate(_reason, state) do
-    stop_scan(state)
+    state |> stop_planner() |> stop_scan()
   end
 
   @doc false
@@ -504,21 +500,11 @@ defmodule OffBroadway.Iceberg.Producer do
        "got: #{inspect(snapshot_id)}"}
   end
 
-  @doc false
-  def validate_key(key) do
-    case key do
-      column when is_binary(column) -> validate_key([column])
-      [_ | _] = columns -> if Enum.all?(columns, &Scan.name_part?/1), do: {:ok, columns}, else: invalid_key(key)
-      _other -> invalid_key(key)
-    end
-  end
-
-  defp invalid_key(key), do: {:error, "expected a column name or a non-empty list of them, got: #{inspect(key)}"}
-
   defp validate_options!(opts) do
     # Broadway injects :broadway (pipeline name and stage index) into the producer's options.
     {_broadway, opts} = Keyword.pop(opts, :broadway)
     opts = NimbleOptions.validate!(opts, @opts_schema)
+    opts = Keyword.update!(opts, :distribute, &validate_distribute!/1)
 
     if opts[:distribute] && opts[:snapshot_id] == :current do
       raise ArgumentError,
@@ -529,16 +515,48 @@ defmodule OffBroadway.Iceberg.Producer do
     opts
   end
 
-  defp join(state, nil), do: state
+  defp validate_distribute!(false), do: nil
+  defp validate_distribute!(true), do: [slice_rows: @slice_rows]
 
-  defp join(state, distribute) do
-    key = Keyword.fetch!(distribute, :key)
-    slices = Keyword.fetch!(distribute, :slices)
-    snapshot_id = Keyword.fetch!(state.scan_opts, :snapshot_id)
-    group = {state.name, Scan.table_parts(state.table), snapshot_id, key, slices}
+  defp validate_distribute!(distribute) do
+    NimbleOptions.validate!(distribute, slice_rows: [type: :pos_integer, default: @slice_rows])
+  rescue
+    error in NimbleOptions.ValidationError ->
+      reraise NimbleOptions.ValidationError,
+              [message: "invalid value for :distribute option: #{Exception.message(error)}", key: :distribute],
+              __STACKTRACE__
+  end
+
+  defp plan(state, distribute) do
+    ref = make_ref()
+    opts = Keyword.put(state.scan_opts, :slice_rows, Keyword.fetch!(distribute, :slice_rows))
+
+    %{state | planner: %{pid: Scan.plan(self(), ref, opts), ref: ref}}
+  end
+
+  # Producers only share progress if they planned the same slices, because slices are
+  # known to each other by their position in the plan.
+  defp join(state) do
+    plan = :erlang.phash2(state.units)
+    group = {state.name, Scan.table_parts(state.table), state.snapshot_id, plan}
     {monitor, members} = Distribution.join(group)
 
-    %{state | key: key, slices: slices, group: group, monitor: monitor, members: members}
+    %{state | group: group, monitor: monitor, members: members}
+  end
+
+  defp fail(state, what, reason) do
+    Logger.error(
+      "Scan of #{what} failed after #{state.emitted} batches and will not be " <>
+        "retried#{if state.distributed?, do: " by this producer", else: ""}: #{format_reason(reason)}"
+    )
+
+    :telemetry.execute(
+      [:off_broadway_iceberg, :scan, :exception],
+      %{duration: duration(state), batches: state.emitted, rows: state.rows},
+      Map.merge(event_metadata(state), %{kind: :error, reason: reason})
+    )
+
+    leave(%{state | status: :failed})
   end
 
   defp leave(%{group: nil} = state), do: state
@@ -550,7 +568,7 @@ defmodule OffBroadway.Iceberg.Producer do
 
   # Starts reading the first slice this producer owns that is neither finished nor read
   # by it already, if it is not reading one.
-  defp next_slice(%{status: :running, scan: nil} = state) do
+  defp next_slice(%{status: :running, scan: nil, slices: slices} = state) when is_integer(slices) do
     read = MapSet.new(Map.values(state.reads), & &1.slice)
 
     slice =
@@ -568,9 +586,9 @@ defmodule OffBroadway.Iceberg.Producer do
 
   defp read_slice(state, slice) do
     ref = make_ref()
-    filter = if state.group, do: {state.key, state.slices, slice}
-    # Once resolved, later slices read the same snapshot without resolving it again.
-    snapshot_id = if is_integer(state.snapshot_id), do: state.snapshot_id, else: state.scan_opts[:snapshot_id]
+    filter = if state.units, do: {:files, elem(state.units, slice)}
+    # A distributed scan read its snapshot when planning.
+    snapshot_id = if state.units, do: state.snapshot_id, else: state.scan_opts[:snapshot_id]
 
     opts = Keyword.merge(state.scan_opts, snapshot_id: snapshot_id, slice: filter)
     read = %{slice: slice, emitted: 0, acked: 0, failed: 0, rows: 0, exhausted?: false, dropped?: false}
@@ -634,6 +652,13 @@ defmodule OffBroadway.Iceberg.Producer do
 
   defp drop_finished_slice(state), do: state
 
+  defp stop_planner(%{planner: nil} = state), do: state
+
+  defp stop_planner(state) do
+    Scan.cancel(state.planner.pid)
+    %{state | planner: nil}
+  end
+
   defp stop_scan(%{scan: nil} = state), do: state
 
   defp stop_scan(state) do
@@ -661,12 +686,13 @@ defmodule OffBroadway.Iceberg.Producer do
 
   defp maybe_complete(state), do: state
 
-  defp describe(%{group: nil} = state, _slice) do
+  defp describe(%{units: nil} = state, _slice) do
     "#{inspect(state.table)} at snapshot #{inspect(state.snapshot_id)}"
   end
 
   defp describe(state, slice) do
-    "slice #{slice} of #{state.slices} of #{inspect(state.table)} at snapshot #{inspect(state.snapshot_id)}"
+    "slice #{slice} of #{state.slices} (#{length(elem(state.units, slice))} data files) of " <>
+      "#{inspect(state.table)} at snapshot #{inspect(state.snapshot_id)}"
   end
 
   defp event_metadata(state) do

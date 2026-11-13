@@ -8,10 +8,13 @@ defmodule OffBroadway.Iceberg.ClusterTest do
 
   @moduletag :capture_log
 
+  # 32 data files of 10 rows. With a slice of 10 rows, each file is a slice, and with 5
+  # rows per message, each slice makes 2 messages.
   @slices 32
   @rows 320
-  # 10 rows per slice and 5 rows per message make 2 messages per slice.
   @batches 64
+  @files for file <- 0..(@slices - 1),
+             do: {"file-#{String.pad_leading("#{file}", 2, "0")}", Enum.map((file * 10)..(file * 10 + 9), &[&1])}
 
   setup_all do
     if !Node.alive?() do
@@ -82,11 +85,11 @@ defmodule OffBroadway.Iceberg.ClusterTest do
     opts =
       Keyword.merge(
         [
-          rows: Enum.map(0..(@rows - 1), &[&1]),
+          files: @files,
           table: table,
           snapshot_id: 42,
           fetch_size: 5,
-          distribute: [key: "id", slices: @slices]
+          distribute: [slice_rows: 10]
         ],
         opts
       )

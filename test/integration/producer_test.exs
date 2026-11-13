@@ -289,13 +289,18 @@ defmodule OffBroadway.Iceberg.Integration.ProducerTest do
   end
 
   describe "distributed scans" do
-    test "producer stages share one scan, sliced by DuckDB's hash", %{schema: schema} do
+    test "producer stages share one scan, sliced by data file, with deletes applied", %{schema: schema} do
       table = Iceberg.create_table!(@pool, schema)
-      snapshot = Iceberg.insert!(@pool, table, 0..19_999)
+      # 16 inserts make 16 data files of 1,250 rows, and the delete adds delete files.
+      for file <- 0..15, do: Iceberg.insert!(@pool, table, (file * 1_250)..(file * 1_250 + 1_249))
+      QuackDB.query!(@pool, "DELETE FROM #{table} WHERE id % 7 = 0")
+      snapshot = @pool |> Iceberg.snapshots(table) |> List.last()
+      expected_ids = Enum.reject(0..19_999, &(rem(&1, 7) == 0))
       name = unique_name()
       Telemetry.attach_pipeline(name)
 
-      start_pipeline(name, [table: table, snapshot_id: snapshot, fetch_size: 500, distribute: [key: "id", slices: 16]],
+      # Slices of at least 2,500 rows hold two files each.
+      start_pipeline(name, [table: table, snapshot_id: snapshot, fetch_size: 500, distribute: [slice_rows: 2_500]],
         producer_concurrency: 2,
         processor_concurrency: 4,
         max_demand: 2
@@ -304,19 +309,23 @@ defmodule OffBroadway.Iceberg.Integration.ProducerTest do
       # Every producer stage reports the whole scan.
       for _stage <- 1..2 do
         assert_receive {:telemetry, [:off_broadway_iceberg, :scan, :stop], measurements, %{name: ^name}}, 60_000
-        assert %{rows: 20_000, failed_batches: 0} = measurements
+        assert measurements == Map.merge(measurements, %{rows: length(expected_ids), failed_batches: 0})
       end
 
       messages = drain_handled()
-      assert messages |> ids() |> Enum.uniq() == Enum.to_list(0..19_999)
-      assert messages |> Enum.map(& &1.metadata.slice) |> Enum.uniq() |> Enum.sort() == Enum.to_list(0..15)
+      assert messages |> ids() |> Enum.uniq() == expected_ids
+      assert messages |> Enum.map(& &1.metadata.slice) |> Enum.uniq() |> Enum.sort() == Enum.to_list(0..7)
 
-      # Each slice holds the rows DuckDB hashes to it.
-      %{rows: expected} = QuackDB.query!(@pool, "SELECT id, hash(id) % 16 FROM #{table}")
-      expected = Map.new(expected, fn [id, slice] -> {id, slice} end)
+      # Slice i holds the rows of the data files 2 * i and 2 * i + 1, in path order.
+      %{rows: files} =
+        QuackDB.query!(@pool, "SELECT file_path FROM iceberg_files(?) WHERE content = 0 ORDER BY file_path", [table])
+
+      slice_of_file = files |> List.flatten() |> Enum.with_index() |> Map.new(fn {path, i} -> {path, div(i, 2)} end)
+      %{rows: rows} = QuackDB.query!(@pool, "SELECT id, filename FROM #{table}")
+      slice_of_id = Map.new(rows, fn [id, path] -> {id, slice_of_file[path]} end)
 
       for message <- messages, id <- QuackDB.Columns.get(message.data, "id") do
-        assert expected[id] == message.metadata.slice
+        assert slice_of_id[id] == message.metadata.slice
       end
     end
 
