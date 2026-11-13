@@ -94,10 +94,17 @@ defmodule OffBroadway.Iceberg.Checkpoint.GCS do
   Objects are created with the precondition `ifGenerationMatch=0`, so GCS creates one
   only if there is no object by that name, and producers racing to create the same one
   cannot overwrite each other. When the object exists, GCS responds `412 Precondition
-  Failed`, and the adapter reads it. If it records the same job, or the same slice with
-  the same rows, the write succeeds: another producer finished that slice too, or an
-  earlier attempt was stored although its response was lost. Otherwise it fails with an
-  `:incompatible` `OffBroadway.Iceberg.Checkpoint.Error`.
+  Failed`, and the adapter reads it. If it records the same job, every field the same,
+  or the same slice with the same rows, the write succeeds: another producer finished
+  that slice too, or an earlier attempt was stored although its response was lost.
+  Otherwise it fails with an `:incompatible` `OffBroadway.Iceberg.Checkpoint.Error`.
+
+  A job's table is recorded as the name parts the producer resolved `:table` to, so
+  `"lake.betting.events"` and `["lake", "betting", "events"]` are the same table, but
+  `"events"` is another one, even where DuckDB resolves it to the same table.
+
+  `namespace/1` is the endpoint, bucket and prefix, so producers only share a scan with
+  producers that record it in the same folder of the same bucket.
 
   Failed requests are retried with Req's `retry: :transient`, POSTs included, since
   creating an object that exists already changes nothing. A request that still fails is
@@ -161,6 +168,10 @@ defmodule OffBroadway.Iceberg.Checkpoint.GCS do
       {:ok, Map.new(opts)}
     end
   end
+
+  # Buckets are global, but an emulator has buckets of its own, so the endpoint counts.
+  @impl true
+  def namespace(config), do: {config.endpoint, config.bucket, config.prefix}
 
   @impl true
   def load(config, job) do
@@ -265,6 +276,8 @@ defmodule OffBroadway.Iceberg.Checkpoint.GCS do
     end)
   end
 
+  # Every field of a job is immutable, so the recorded one must match all of them,
+  # and have no others.
   defp match_job(metadata, config, object, job) do
     expected = to_metadata(job_record(job))
 
@@ -272,23 +285,29 @@ defmodule OffBroadway.Iceberg.Checkpoint.GCS do
       metadata["version"] != expected["version"] ->
         {:error, unsupported(config, object, metadata)}
 
-      Map.take(metadata, ~w(job_id snapshot_id plan_fingerprint)) ==
-          Map.take(expected, ~w(job_id snapshot_id plan_fingerprint)) ->
+      metadata == expected ->
         :ok
 
       true ->
+        differences =
+          for key <- (Map.keys(metadata) ++ Map.keys(expected)) |> Enum.uniq() |> Enum.sort(),
+              metadata[key] != expected[key] do
+            "#{key} #{describe_field(metadata[key])} (this run: #{describe_field(expected[key])})"
+          end
+
         {:error,
          %Error{
            reason: :incompatible,
            message:
-             "#{url(config, object)} records job #{inspect(metadata["job_id"])} at snapshot " <>
-               "#{metadata["snapshot_id"]} with plan #{short(metadata["plan_fingerprint"])}, not snapshot " <>
-               "#{expected["snapshot_id"]} with plan #{short(expected["plan_fingerprint"])}. A job id can only " <>
-               "be used for one snapshot and plan: use another job id, or the snapshot and :slice_rows the job " <>
-               "started with"
+             "#{url(config, object)} records another job under this id, with #{Enum.join(differences, ", ")}. " <>
+               "A job id names one table, snapshot and plan: use another job id, or the same table name, " <>
+               "snapshot and :slice_rows as the job's first run"
          }}
     end
   end
+
+  defp describe_field(nil), do: "missing"
+  defp describe_field(value), do: inspect(value)
 
   defp match_slice(metadata, config, object, slice, result) do
     case parse_slice(metadata) do
@@ -380,9 +399,6 @@ defmodule OffBroadway.Iceberg.Checkpoint.GCS do
   defp slice_file(slice), do: String.pad_leading(Integer.to_string(slice), 6, "0") <> ".json"
 
   defp url(config, object), do: "gs://#{config.bucket}/#{object}"
-
-  defp short(fingerprint) when is_binary(fingerprint), do: binary_part(fingerprint, 0, min(12, byte_size(fingerprint)))
-  defp short(fingerprint), do: inspect(fingerprint)
 
   ## Requests
 

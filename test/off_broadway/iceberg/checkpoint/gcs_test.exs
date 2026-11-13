@@ -116,24 +116,53 @@ defmodule OffBroadway.Iceberg.Checkpoint.GCSTest do
       assert fake |> FakeGCS.requests() |> Enum.count(&match?({:list, _request}, &1)) == 4
     end
 
-    test "refuses a job id recorded for another snapshot or plan, and leaves it as it was" do
+    test "refuses a job id recorded with any other field, and leaves it as it was" do
       {config, fake} = start()
       assert {:ok, %{}} = GCS.load(config, @job)
       recorded = FakeGCS.objects(fake)
 
-      for other <- [%{@job | snapshot_id: 1}, %{@job | plan: :crypto.hash(:sha256, "other")}] do
+      for {other, fields} <- [
+            {%{@job | table: ["events"]}, ["table"]},
+            {%{@job | slices: 9}, ["slices"]},
+            {%{@job | snapshot_id: 1}, ["snapshot_id"]},
+            {%{@job | plan: :crypto.hash(:sha256, "other")}, ["plan_fingerprint"]},
+            {%{@job | snapshot_id: 1, slices: 9}, ["slices", "snapshot_id"]}
+          ] do
         assert {:error, %Error{reason: :incompatible, message: message}} = GCS.load(config, other)
-        assert message =~ "gs://checkpoints/jobs/events-backfill-2026-11/job.json records job"
+        assert message =~ "gs://checkpoints/jobs/events-backfill-2026-11/job.json records another job under this id"
+
+        for field <- ~w(table slices snapshot_id plan_fingerprint) do
+          assert Regex.match?(~r/(with|,) #{field} /, message) == field in fields, "#{field} in: #{message}"
+        end
       end
 
+      assert {:error, %Error{message: message}} = GCS.load(config, %{@job | table: ["events"]})
+      assert message =~ ~s{with table "[\\"lake\\",\\"betting\\",\\"events\\"]" (this run: "[\\"events\\"]")}
       assert FakeGCS.objects(fake) == recorded
     end
 
-    test "accepts the same job however its table was named" do
-      {config, _fake} = start()
+    test "refuses a recorded job with a field it does not know, or without one" do
+      object = "jobs/events-backfill-2026-11/job.json"
 
-      assert {:ok, %{}} = GCS.load(config, @job)
-      assert {:ok, %{}} = GCS.load(config, %{@job | table: ["events"]})
+      for {change, difference} <- [
+            {&Map.put(&1, "owner", "someone"), ~s{owner "someone" (this run: missing)}},
+            {&Map.delete(&1, "slices"), ~s{slices missing (this run: "8")}}
+          ] do
+        {config, fake} = start()
+        assert {:ok, %{}} = GCS.load(config, @job)
+        FakeGCS.put(fake, object, change.(FakeGCS.objects(fake)[object].metadata))
+
+        assert {:error, %Error{reason: :incompatible, message: message}} = GCS.load(config, @job)
+        assert message =~ difference
+      end
+    end
+
+    test "identifies its storage by endpoint, bucket and prefix" do
+      {:ok, config} = GCS.init(bucket: "b-1", auth: :none, prefix: "iceberg", endpoint: "http://localhost:4443/")
+      assert GCS.namespace(config) == {"http://localhost:4443", "b-1", "iceberg/"}
+
+      {:ok, config} = GCS.init(bucket: "b-1", auth: fn -> {:ok, "token"} end, req_options: [receive_timeout: 1])
+      assert GCS.namespace(config) == {"https://storage.googleapis.com", "b-1", ""}
     end
 
     test "keeps every job id apart, under the prefix" do

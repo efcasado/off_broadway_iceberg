@@ -211,12 +211,14 @@ with `ifGenerationMatch=0` and never changed, so producers on any node can recor
 slice at once without overwriting each other.
 
 - `:job_id` names the job: one scan of one snapshot. Every run of the job checks, before
-  reading a row, that it planned the same snapshot and slices as the first run, and fails
-  if it did not. Keep `:slice_rows` for the life of a job, and use a new job id to start
-  over.
+  reading a row, that its table, snapshot and slices are those of the first run, and fails
+  if any is not. Keep `:table`'s name and `:slice_rows` for the life of a job, and use a new
+  job id to start over.
+- Producers share a job's scan if they have the same job id and record it in the same
+  bucket and prefix. Producers that record it elsewhere scan it apart.
 - A slice is recorded once every one of its batches was acknowledged successfully, and only
   then counts as finished. A slice with failed batches is not recorded: the run reports it
-  in `:stop`, and the next run of the job reads it again.
+  in `:stop` without retrying it, and the next run of the job reads it again.
 - A backend that cannot be reached fails the scan, with `:exception`. It is never taken for
   a job with nothing finished, and a write that was not confirmed never counts as recorded.
 - Processing is still at least once: a slice can be processed and not recorded, if its

@@ -4,15 +4,16 @@ defmodule OffBroadway.Iceberg.Test.Checkpoint do
 
   Start a store with `start_link/1` and pass it to producers as
   `backend: {OffBroadway.Iceberg.Test.Checkpoint, store: store}`. The store keeps records
-  as a real backend does: a job id is bound to the first snapshot and plan it is loaded
-  with, and a slice is recorded once. It reports every call to the test as
-  `{:checkpoint, event}`:
+  as a real backend does: a job id is bound to the first job it is loaded with, every
+  field of it, and a slice is recorded once. The store is the backend's namespace. It
+  reports every call to the test as `{:checkpoint, event}`:
 
   - `{:load, job}`
   - `{:complete, job_id, slice, result}` - when the write starts
 
   `hold/1` makes writes wait until `release/1`, and `fail/3` makes calls fail until it is
-  called again with `nil`.
+  called again with `nil`. The `:fail_complete` option makes the writes of one producer
+  fail with that reason, without the store seeing them.
   """
 
   @behaviour OffBroadway.Iceberg.Checkpoint
@@ -23,16 +24,23 @@ defmodule OffBroadway.Iceberg.Test.Checkpoint do
   @impl true
   def init(opts) do
     case Keyword.fetch(opts, :store) do
-      {:ok, store} -> {:ok, store}
+      {:ok, store} -> {:ok, %{store: store, fail_complete: Keyword.get(opts, :fail_complete)}}
       :error -> {:error, "required :store option not found"}
     end
   end
 
   @impl true
-  def load(store, job), do: GenServer.call(store, {:load, job}, :infinity)
+  def namespace(%{store: store}), do: store
 
   @impl true
-  def complete(store, job, slice, result), do: GenServer.call(store, {:complete, job, slice, result}, :infinity)
+  def load(%{store: store}, job), do: GenServer.call(store, {:load, job}, :infinity)
+
+  @impl true
+  def complete(%{fail_complete: nil, store: store}, job, slice, result) do
+    GenServer.call(store, {:complete, job, slice, result}, :infinity)
+  end
+
+  def complete(%{fail_complete: reason}, _job, _slice, _result), do: {:error, reason}
 
   @doc "Starts a store that reports to the caller, or to `:test`."
   def start_link(opts \\ []), do: GenServer.start_link(Store, Keyword.put_new(opts, :test, self()))
@@ -40,8 +48,8 @@ defmodule OffBroadway.Iceberg.Test.Checkpoint do
   @doc "Records `slices`, a map of slice to result, for `job_id`, as an earlier run would."
   def put_slices(store, job_id, slices), do: GenServer.call(store, {:put_slices, job_id, slices})
 
-  @doc "Binds `job_id` to `snapshot_id` and `plan`, as an earlier run would."
-  def put_job(store, job_id, snapshot_id, plan), do: GenServer.call(store, {:put_job, job_id, snapshot_id, plan})
+  @doc "Records `job`, as an earlier run would."
+  def put_job(store, job), do: GenServer.call(store, {:put_job, job})
 
   @doc "The recorded slices of `job_id`."
   def slices(store, job_id), do: GenServer.call(store, {:slices, job_id})
@@ -73,13 +81,13 @@ defmodule OffBroadway.Iceberg.Test.Checkpoint do
         reason = state.fail[:load] ->
           {:reply, {:error, reason}, state}
 
-        bound = state.jobs[job.id] ->
-          if bound == {job.snapshot_id, job.plan},
+        recorded = state.jobs[job.id] ->
+          if recorded == job,
             do: {:reply, {:ok, Map.get(state.slices, job.id, %{})}, state},
             else: {:reply, {:error, %Error{reason: :incompatible, message: "another job"}}, state}
 
         true ->
-          state = put_in(state.jobs[job.id], {job.snapshot_id, job.plan})
+          state = put_in(state.jobs[job.id], job)
           {:reply, {:ok, Map.get(state.slices, job.id, %{})}, state}
       end
     end
@@ -98,9 +106,7 @@ defmodule OffBroadway.Iceberg.Test.Checkpoint do
       {:reply, :ok, update_in(state.slices, &Map.update(&1, job_id, slices, fn old -> Map.merge(old, slices) end))}
     end
 
-    def handle_call({:put_job, job_id, snapshot_id, plan}, _from, state) do
-      {:reply, :ok, put_in(state.jobs[job_id], {snapshot_id, plan})}
-    end
+    def handle_call({:put_job, job}, _from, state), do: {:reply, :ok, put_in(state.jobs[job.id], job)}
 
     def handle_call({:slices, job_id}, _from, state), do: {:reply, Map.get(state.slices, job_id, %{}), state}
     def handle_call(:hold, _from, state), do: {:reply, :ok, %{state | held: state.held || []}}
