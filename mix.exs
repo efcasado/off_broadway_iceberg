@@ -30,6 +30,7 @@ defmodule OffBroadwayIceberg.MixProject do
               const sources = new WeakMap();
               let lastDark = null;
               let rendering = false;
+              let rerenderRequested = false;
 
               const isDark = () => {
                 const theme = document.documentElement.dataset.theme || document.body.dataset.theme;
@@ -41,7 +42,11 @@ defmodule OffBroadwayIceberg.MixProject do
               };
 
               async function renderDiagrams() {
-                if (!window.mermaid || rendering) return;
+                if (!window.mermaid) return;
+                if (rendering) {
+                  rerenderRequested = true;
+                  return;
+                }
                 rendering = true;
 
                 try {
@@ -79,10 +84,15 @@ defmodule OffBroadwayIceberg.MixProject do
                   lastDark = dark;
                 } finally {
                   rendering = false;
+                  if (rerenderRequested || (lastDark !== null && isDark() !== lastDark)) {
+                    rerenderRequested = false;
+                    void renderDiagrams();
+                  }
                 }
               }
 
               window.addEventListener("exdoc:loaded", () => { void renderDiagrams(); });
+              window.addEventListener("load", () => { void renderDiagrams(); });
 
               const observer = new MutationObserver(() => {
                 if (lastDark !== null && isDark() !== lastDark) void renderDiagrams();
