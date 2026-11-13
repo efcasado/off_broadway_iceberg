@@ -909,8 +909,9 @@ defmodule OffBroadway.Iceberg.Producer do
   defp plan(state, distribute) do
     ref = make_ref()
     opts = Keyword.put(state.scan_opts, :slice_rows, Keyword.fetch!(distribute, :slice_rows))
+    {:ok, pid} = Scan.plan(self(), ref, opts)
 
-    %{state | planner: %{pid: Scan.plan(self(), ref, opts), ref: ref}}
+    %{state | planner: %{pid: pid, ref: ref}}
   end
 
   defp checkpoint_state(checkpoint) do
@@ -1069,10 +1070,11 @@ defmodule OffBroadway.Iceberg.Producer do
 
     opts = Keyword.merge(state.scan_opts, snapshot_id: snapshot_id, slice: filter)
     read = %{slice: slice, emitted: 0, acked: 0, failed: 0, rows: 0, exhausted?: false, dropped?: false}
+    {:ok, pid} = Scan.start_link(self(), ref, opts)
 
     request_batches(%{
       state
-      | scan: %{pid: Scan.start_link(self(), ref, opts), ref: ref, slice: slice},
+      | scan: %{pid: pid, ref: ref, slice: slice},
         reads: Map.put(state.reads, ref, read),
         requested: 0
     })

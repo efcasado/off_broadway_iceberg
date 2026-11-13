@@ -26,10 +26,9 @@ defmodule OffBroadway.Iceberg.Scan do
   @doc """
   Starts the scan for `producer`, linked to the caller.
   """
-  @spec start_link(pid(), reference(), keyword()) :: pid()
+  @spec start_link(pid(), reference(), keyword()) :: {:ok, pid()}
   def start_link(producer, ref, opts) do
-    {:ok, scan} = Task.start_link(fn -> run(producer, ref, opts) end)
-    scan
+    Task.start_link(fn -> run(producer, ref, opts) end)
   end
 
   @doc """
@@ -37,14 +36,11 @@ defmodule OffBroadway.Iceberg.Scan do
   and divides its data files into slices of whole files, in path order, each with at
   least `:slice_rows` rows but the last. Files are never split.
   """
-  @spec plan(pid(), reference(), keyword()) :: pid()
+  @spec plan(pid(), reference(), keyword()) :: {:ok, pid()}
   def plan(producer, ref, opts) do
-    {:ok, planner} =
-      Task.start_link(fn ->
-        send(producer, {__MODULE__, ref, with_connection(opts, &plan_slices(&1, opts))})
-      end)
-
-    planner
+    Task.start_link(fn ->
+      send(producer, {__MODULE__, ref, with_connection(opts, &plan_slices(&1, opts))})
+    end)
   end
 
   @doc """
