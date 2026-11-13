@@ -362,6 +362,9 @@ defmodule OffBroadway.Iceberg.Producer do
   A producer emits `:stop` only once its own writes have returned, so a pipeline stopped
   on `:stop` does not cut one short.
 
+  Each producer waits for its current slice's acknowledgements and checkpoint before
+  starting another slice, so a slow backend pauses the scan instead of accumulating writes.
+
   ### Failures
 
   A producer that cannot load its job, or cannot record a slice it finished, fails its
@@ -786,6 +789,11 @@ defmodule OffBroadway.Iceberg.Producer do
     Distribution.leave(state.group, state.monitor)
     %{state | monitor: nil}
   end
+
+  # A checkpointed producer finishes and records one slice before reading the next,
+  # bounding both pending acknowledgements and checkpoint tasks across slice boundaries.
+  defp next_slice(%{checkpoint: checkpoint, reads: reads, writes: writes} = state)
+       when checkpoint != nil and (map_size(reads) > 0 or map_size(writes) > 0), do: state
 
   # Starts reading the first slice this producer owns that is neither finished nor read
   # or being checkpointed by it already, if it is not reading one.

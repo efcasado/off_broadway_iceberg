@@ -85,11 +85,15 @@ defmodule OffBroadway.Iceberg.CheckpointTest do
       %{consumer: consumer} = start_member(ctx, :a)
       ManualConsumer.ask(consumer, 1_000)
 
-      written = for _slice <- 1..@slices, do: receive_write(job_id)
-      assert Enum.sort(written) == for(slice <- 0..(@slices - 1), do: {slice, @result})
+      assert {0, @result} = receive_write(job_id)
+      refute_receive {:checkpoint, {:complete, _, _, _}}, 100
+      assert Checkpoint.slices(ctx.store, job_id) == %{}
       refute_receive {:telemetry, @stop, _measurements, _metadata}, 200
 
       Checkpoint.release(ctx.store)
+
+      written = for _slice <- 1..(@slices - 1), do: receive_write(job_id)
+      assert Enum.sort(written) == for(slice <- 1..(@slices - 1), do: {slice, @result})
 
       assert_receive {:telemetry, @stop, measurements, %{job_id: ^job_id}}, 5_000
       assert %{rows: @rows, batches: @batches, failed_batches: 0} = measurements
@@ -98,6 +102,24 @@ defmodule OffBroadway.Iceberg.CheckpointTest do
       for _slice <- 1..@slices do
         assert_received {:telemetry, @write, %{batches: 2, rows: 10, duration: _}, %{slice: _, job_id: ^job_id}}
       end
+    end
+
+    test "waits for every acknowledgement before starting the next slice", ctx do
+      %{producer: producer} = start_member(ctx, :a, ack: false)
+      {:ok, consumer} = ManualConsumer.start_link(producer, tag: :a)
+      ManualConsumer.ask(consumer, 1_000)
+
+      [first, last] = received_all(:a, 2)
+      assert first.metadata.slice == 0 and last.metadata.slice == 0
+      refute_receive {:messages, :a, _messages}, 100
+
+      Broadway.Acknowledger.ack_messages([first], [])
+      refute_receive {:checkpoint, {:complete, _, _, _}}, 100
+      refute_receive {:messages, :a, _messages}, 100
+
+      Broadway.Acknowledger.ack_messages([last], [])
+      assert {0, @result} = receive_write(ctx.job_id)
+      assert [%{metadata: %{slice: 1}}, %{metadata: %{slice: 1}}] = received_all(:a, 2)
     end
 
     test "does not read the slices an earlier run of its job finished", ctx do
@@ -244,13 +266,16 @@ defmodule OffBroadway.Iceberg.CheckpointTest do
       %{producer: producer} = start_member(ctx, :a, ack: false)
       {:ok, consumer} = ManualConsumer.start_link(producer, tag: :a)
       ManualConsumer.ask(consumer, 1_000)
-      messages = received_all(:a, @batches)
-
-      {[failing], successful} = Enum.split_with(messages, &(&1.metadata.slice == 5 and &1.metadata.batch_index == 1))
 
       log =
         capture_log(fn ->
-          Broadway.Acknowledger.ack_messages(successful, [Message.failed(failing, "boom")])
+          for slice <- 0..(@slices - 1) do
+            messages = received_all(:a, 2)
+            assert Enum.all?(messages, &(&1.metadata.slice == slice))
+            {failed, successful} = Enum.split_with(messages, &(&1.metadata.slice == 5 and &1.metadata.batch_index == 1))
+            Broadway.Acknowledger.ack_messages(successful, Enum.map(failed, &Message.failed(&1, "boom")))
+          end
+
           assert_receive {:telemetry, @stop, %{failed_batches: 1, rows: @rows}, %{job_id: ^job_id}}, 5_000
         end)
 

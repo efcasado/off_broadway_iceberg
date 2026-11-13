@@ -9,8 +9,8 @@ defmodule OffBroadway.Iceberg.Checkpoint do
   ## Implementing a backend
 
   A backend is a module that implements this behaviour. The producer calls `c:init/1`
-  and `c:namespace/1` when it starts, and `c:load/2` and `c:complete/4` from processes of
-  its own, so a slow backend does not hold up the pipeline. Several producers, on several
+  and `c:namespace/1` when it starts, and `c:load/2` and `c:complete/4` from worker processes,
+  so it remains responsive while waiting for storage. Several producers, on several
   nodes, call them for the same job at the same time.
 
   Producers only share a scan's progress while it runs if they record it in the same
