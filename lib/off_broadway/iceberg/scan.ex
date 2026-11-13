@@ -117,6 +117,7 @@ defmodule OffBroadway.Iceberg.Scan do
         {:plan, nil, []}
 
       snapshot_id ->
+        check_filename_column(conn, table, snapshot_id)
         check_selection(conn, table, snapshot_id, opts)
 
         # The live data files of the snapshot, from its manifests. Reading them needs only
@@ -131,6 +132,19 @@ defmodule OffBroadway.Iceberg.Scan do
           )
 
         {:plan, snapshot_id, slices(files, Keyword.fetch!(opts, :slice_rows))}
+    end
+  end
+
+  # SELECT * exposes physical columns and excludes virtual ones. Check the full schema
+  # even when the projection omits filename: the slice filter runs before that projection.
+  defp check_filename_column(conn, table, snapshot_id) do
+    %{columns: columns} = QuackDB.query!(conn, ["SELECT * FROM ", table, " AT (VERSION => ?) LIMIT 0"], [snapshot_id])
+    column = Enum.find(columns, &(String.downcase(&1) == "filename"))
+
+    if column do
+      raise ArgumentError,
+            "cannot distribute a table with a column named #{inspect(column)}: it shadows DuckDB's " <>
+              "virtual filename column used to select slice files. Read it without :distribute"
     end
   end
 

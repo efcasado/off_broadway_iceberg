@@ -289,6 +289,32 @@ defmodule OffBroadway.Iceberg.Integration.ProducerTest do
   end
 
   describe "distributed scans" do
+    test "rejects physical filename columns even when the projection excludes them", %{schema: schema} do
+      for column <- ["filename", "FileName"] do
+        table = "#{schema}.filename_#{System.unique_integer([:positive])}"
+        QuackDB.query!(@pool, ~s|CREATE TABLE #{table} (id BIGINT, "#{column}" VARCHAR)|)
+        QuackDB.query!(@pool, "INSERT INTO #{table} VALUES (1, 'a.csv'), (2, 'b.csv')")
+        snapshot = @pool |> Iceberg.snapshots(table) |> List.last()
+
+        {messages, %{rows: 2}, _metadata} = scan(table: table, snapshot_id: snapshot, columns: ["id"])
+        assert ids(messages) == [1, 2]
+
+        name = unique_name()
+        Telemetry.attach_pipeline(name)
+        start_pipeline(name, table: table, snapshot_id: snapshot, distribute: true, columns: ["id"])
+
+        assert_receive {:telemetry, [:off_broadway_iceberg, :scan, outcome], measurements, %{name: ^name} = metadata}
+                       when outcome in [:stop, :exception],
+                       30_000
+
+        assert outcome == :exception
+        assert %{batches: 0} = measurements
+        assert %ArgumentError{message: message} = metadata.reason
+        assert message =~ "virtual filename column"
+        refute_received {:handled, _message, _processor}
+      end
+    end
+
     test "producer stages share one scan, sliced by data file, with deletes applied", %{schema: schema} do
       table = Iceberg.create_table!(@pool, schema)
       # 16 inserts make 16 data files of 1,250 rows, and the delete adds delete files.

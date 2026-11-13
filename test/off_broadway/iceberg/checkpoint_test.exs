@@ -78,6 +78,16 @@ defmodule OffBroadway.Iceberg.CheckpointTest do
   end
 
   describe "a checkpointed scan" do
+    test "rejects a filename column before recording a job", ctx do
+      start_member(ctx, :a, script: [files: @files, columns: ["id", "filename"]], producer: [columns: ["id"]])
+
+      assert_receive {:telemetry, @exception, %{batches: 0}, %{reason: %ArgumentError{message: message}}}
+      assert message =~ "virtual filename column"
+      refute_received {:checkpoint, {:load, _job}}
+      refute_received {:checkpoint, {:complete, _job_id, _slice, _result}}
+      refute_received {:fake, {:declare, _statement, _params, _max_rows}}
+    end
+
     test "records each slice once all its batches succeeded, and only then counts it finished", ctx do
       %{job_id: job_id} = ctx
       Checkpoint.hold(ctx.store)

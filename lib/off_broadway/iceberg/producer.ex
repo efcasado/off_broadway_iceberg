@@ -284,6 +284,9 @@ defmodule OffBroadway.Iceberg.Producer do
     the pipeline name. See "Checkpoints" below.
   - `:snapshot_id` must be an integer or `{:as_of, datetime}`. Members resolving
     `:current` at different times could read different snapshots.
+  - The table must not have a physical column named `filename`, regardless of case: it
+    would shadow DuckDB's virtual column used to select slice files. Such tables can be
+    read without `:distribute`.
 
   A member whose slice or plan fails emits `:exception`, leaves the group and stays
   idle. The other members read its slices.

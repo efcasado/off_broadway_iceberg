@@ -16,6 +16,7 @@ defmodule OffBroadway.Iceberg.Test.FakeConnection do
 
   - `:refs` - rows returned by the `iceberg_refs` query (default `[[42]]`)
   - `:history` - rows returned by the `iceberg_history` query (default `[[42]]`)
+  - `:columns` - column names returned when binding a query (default `["id"]`)
   - `:rows` - rows of the scan, as one-element lists (default `[]`)
   - `:files` - data files of the snapshot, as `{path, rows}`, for distributed scans. The
     `iceberg_files` query lists them, and a scan of some files gets their rows
@@ -77,7 +78,7 @@ defmodule OffBroadway.Iceberg.Test.FakeConnection do
     response =
       cond do
         String.contains?(query.statement, "LIMIT 0") ->
-          respond(state, :bind, result(["id"], []))
+          respond(state, :bind, result(Map.get(state.script, :columns, ["id"]), []))
 
         String.contains?(query.statement, "iceberg_refs") ->
           respond(state, :refs, result(["snapshot_id"], Map.get(state.script, :refs, [[42]])))

@@ -190,10 +190,27 @@ defmodule OffBroadway.Iceberg.DistributionTest do
                ~s|SELECT "id" FROM (SELECT * FROM "#{table}" AT (VERSION => ?) WHERE filename IN (?)) | <>
                  ~s|WHERE (\nid >= 0\n)|
 
-      assert [{bind, [42]}, {"SELECT file_path, record_count FROM iceberg_files" <> _, _params}] =
+      assert [{schema, [42]}, {bind, [42]}, {"SELECT file_path, record_count FROM iceberg_files" <> _, _params}] =
                for({:fake, {:query, statement, params}} <- flush(), do: {statement, params})
 
+      assert schema == ~s|SELECT * FROM "#{table}" AT (VERSION => ?) LIMIT 0|
       assert bind == ~s|SELECT "id" FROM (SELECT * FROM "#{table}" AT (VERSION => ?)) WHERE (\nid >= 0\n) LIMIT 0|
+    end
+
+    test "rejects physical filename columns before listing files, even if they are not selected" do
+      pool = start_pool(files: @files, columns: ["id", "FileName"])
+      table = unique_table()
+      Telemetry.attach_scan(table)
+
+      start_member(pool, table, :a, columns: ["id"])
+
+      assert_receive {:telemetry, [:off_broadway_iceberg, :scan, :exception], _,
+                      %{reason: %ArgumentError{message: message}}}
+
+      assert message =~ ~s(column named "FileName")
+      assert message =~ "virtual filename column"
+      refute_received {:fake, {:query, "SELECT file_path" <> _rest, _params}}
+      refute_received {:fake, {:declare, _statement, _params, _max_rows}}
     end
 
     test "a selection DuckDB cannot bind fails the plan, before any data file is listed" do
