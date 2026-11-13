@@ -27,36 +27,70 @@ defmodule OffBroadwayIceberg.MixProject do
           <script>
             (() => {
               let sequence = 0;
+              const sources = new WeakMap();
+              let lastDark = null;
+              let rendering = false;
 
-              window.addEventListener("exdoc:loaded", () => {
-                if (!window.mermaid) return;
+              const isDark = () => {
+                const theme = document.documentElement.dataset.theme || document.body.dataset.theme;
+                if (theme === "dark") return true;
+                if (theme === "light") return false;
+                return document.documentElement.classList.contains("dark") ||
+                  document.body.classList.contains("dark") ||
+                  window.matchMedia("(prefers-color-scheme: dark)").matches;
+              };
 
-                mermaid.initialize({
-                  startOnLoad: false,
-                  theme: document.body.classList.contains("dark") ? "dark" : "default"
-                });
+              async function renderDiagrams() {
+                if (!window.mermaid || rendering) return;
+                rendering = true;
 
-                for (const code of document.querySelectorAll("pre code.mermaid")) {
-                  const pre = code.parentElement;
-                  const container = document.createElement("div");
-                  container.className = "iceberg-mermaid";
-                  container.style.maxWidth = "100%";
-                  const id = "iceberg-mermaid-" + sequence++;
+                try {
+                  const dark = isDark();
+                  mermaid.initialize({ startOnLoad: false, theme: dark ? "dark" : "default" });
 
-                  mermaid.render(id, code.textContent).then(({svg, bindFunctions}) => {
-                    if (!pre.isConnected) return;
-                    container.innerHTML = svg;
-                    const renderedSvg = container.querySelector("svg");
-                    if (renderedSvg) {
-                      renderedSvg.style.maxWidth = "100%";
-                      renderedSvg.style.height = "auto";
+                  for (const code of document.querySelectorAll("pre code.mermaid")) {
+                    const container = document.createElement("div");
+                    container.className = "iceberg-mermaid";
+                    container.style.maxWidth = "100%";
+                    sources.set(container, code.textContent);
+                    code.parentElement.replaceWith(container);
+                  }
+
+                  for (const container of document.querySelectorAll(".iceberg-mermaid")) {
+                    const source = sources.get(container);
+                    if (!source) continue;
+                    const id = "iceberg-mermaid-" + sequence++;
+
+                    try {
+                      const {svg, bindFunctions} = await mermaid.render(id, source);
+                      if (!container.isConnected) continue;
+                      container.innerHTML = svg;
+                      const image = container.querySelector("svg");
+                      if (image) {
+                        image.style.maxWidth = "100%";
+                        image.style.height = "auto";
+                      }
+                      bindFunctions?.(container);
+                    } catch (error) {
+                      console.warn("Could not render Mermaid diagram:", error);
+                      container.textContent = source;
                     }
-                    bindFunctions?.(container);
-                    pre.replaceWith(container);
-                  }).catch(error => {
-                    console.warn("Could not render Mermaid diagram:", error);
-                  });
+                  }
+                  lastDark = dark;
+                } finally {
+                  rendering = false;
                 }
+              }
+
+              window.addEventListener("exdoc:loaded", () => { void renderDiagrams(); });
+
+              const observer = new MutationObserver(() => {
+                if (lastDark !== null && isDark() !== lastDark) void renderDiagrams();
+              });
+              observer.observe(document.documentElement, { attributes: true, attributeFilter: ["class", "data-theme"] });
+              observer.observe(document.body, { attributes: true, attributeFilter: ["class", "data-theme"] });
+              window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+                if (lastDark !== null && isDark() !== lastDark) void renderDiagrams();
               });
             })();
           </script>
