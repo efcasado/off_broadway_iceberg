@@ -9,6 +9,10 @@ The producer runs one query against a fixed snapshot and emits the result as Bro
 messages, one per batch of rows, at the pace Broadway asks for them. Commits made to the
 table while the scan runs are not read.
 
+New to Iceberg or DuckDB? [How Iceberg and DuckDB work here](guides/iceberg-and-duckdb.md)
+explains snapshots, data and delete files, slices and checkpoints, and how this library
+reads a table, in about 15 minutes.
+
 > #### Experimental {: .warning}
 >
 > This is an early release. It reads one snapshot from start to end. It does not poll for

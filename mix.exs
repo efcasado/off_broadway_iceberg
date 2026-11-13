@@ -19,7 +19,94 @@ defmodule OffBroadwayIceberg.MixProject do
       source_url: "https://github.com/efcasado/off_broadway_iceberg",
       docs: [
         main: "OffBroadway.Iceberg.Producer",
-        extras: ["README.md"]
+        extras: ["README.md", "guides/iceberg-and-duckdb.md"],
+        groups_for_extras: [Guides: ~r"guides/"],
+        before_closing_body_tag: %{
+          html: """
+          <script defer src="https://cdn.jsdelivr.net/npm/mermaid@10.9.3/dist/mermaid.min.js"></script>
+          <script>
+            (() => {
+              let sequence = 0;
+              const sources = new WeakMap();
+              let lastDark = null;
+              let rendering = false;
+              let rerenderRequested = false;
+
+              const isDark = () => {
+                const theme = document.documentElement.dataset.theme || document.body.dataset.theme;
+                if (theme === "dark") return true;
+                if (theme === "light") return false;
+                return document.documentElement.classList.contains("dark") ||
+                  document.body.classList.contains("dark") ||
+                  window.matchMedia("(prefers-color-scheme: dark)").matches;
+              };
+
+              async function renderDiagrams() {
+                if (!window.mermaid) return;
+                if (rendering) {
+                  rerenderRequested = true;
+                  return;
+                }
+                rendering = true;
+
+                try {
+                  const dark = isDark();
+                  mermaid.initialize({ startOnLoad: false, theme: dark ? "dark" : "default" });
+
+                  for (const code of document.querySelectorAll("pre code.mermaid")) {
+                    const container = document.createElement("div");
+                    container.className = "iceberg-mermaid";
+                    container.style.maxWidth = "100%";
+                    sources.set(container, code.textContent);
+                    code.parentElement.replaceWith(container);
+                  }
+
+                  for (const container of document.querySelectorAll(".iceberg-mermaid")) {
+                    const source = sources.get(container);
+                    if (!source) continue;
+                    const id = "iceberg-mermaid-" + sequence++;
+
+                    try {
+                      const {svg, bindFunctions} = await mermaid.render(id, source);
+                      if (!container.isConnected) continue;
+                      container.innerHTML = svg;
+                      const image = container.querySelector("svg");
+                      if (image) {
+                        image.style.maxWidth = "100%";
+                        image.style.height = "auto";
+                      }
+                      bindFunctions?.(container);
+                    } catch (error) {
+                      console.warn("Could not render Mermaid diagram:", error);
+                      container.textContent = source;
+                    }
+                  }
+                  lastDark = dark;
+                } finally {
+                  rendering = false;
+                  if (rerenderRequested || (lastDark !== null && isDark() !== lastDark)) {
+                    rerenderRequested = false;
+                    void renderDiagrams();
+                  }
+                }
+              }
+
+              window.addEventListener("exdoc:loaded", () => { void renderDiagrams(); });
+              window.addEventListener("load", () => { void renderDiagrams(); });
+
+              const observer = new MutationObserver(() => {
+                if (lastDark !== null && isDark() !== lastDark) void renderDiagrams();
+              });
+              observer.observe(document.documentElement, { attributes: true, attributeFilter: ["class", "data-theme"] });
+              observer.observe(document.body, { attributes: true, attributeFilter: ["class", "data-theme"] });
+              window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+                if (lastDark !== null && isDark() !== lastDark) void renderDiagrams();
+              });
+            })();
+          </script>
+          """,
+          epub: ""
+        }
       ]
     ]
   end
