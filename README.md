@@ -12,8 +12,9 @@ table while the scan runs are not read.
 > #### Experimental {: .warning}
 >
 > This is an early release. It reads one snapshot from start to end. It does not poll for
-> new snapshots, read incremental changes, or persist progress: a scan that is interrupted
-> starts again from the beginning. See [Failures and replays](#failures-and-replays).
+> new snapshots or read incremental changes, and unless it is checkpointed, a scan that is
+> interrupted starts again from the beginning. See [Failures and replays](#failures-and-replays)
+> and [Checkpoints](#checkpoints).
 
 ## Installation
 
@@ -172,13 +173,60 @@ trade-offs:
   every producer reads the same snapshot.
 - A slice can be processed more than once while producers come and go, or when nodes
   cannot reach each other. Writes must be idempotent.
-- If every node restarts at once, the scan starts over. With an explicit `:snapshot_id` or
-  `{:as_of, datetime}`, it reads the same rows again, so idempotent writes make that
-  harmless. For backfills, record the snapshot and the outcome in your application, and
-  only start the pipeline while the backfill is not complete.
+- If every node restarts at once, the scan starts over, unless it is checkpointed (see
+  below). With an explicit `:snapshot_id` or `{:as_of, datetime}`, it reads the same rows
+  again, so idempotent writes make that harmless.
 
 See "Distributed scans" in `OffBroadway.Iceberg.Producer` for what `:stop` guarantees
 exactly.
+
+### Checkpoints
+
+> #### Experimental {: .warning}
+>
+> Checkpoints are new. Their behavior may change.
+
+A distributed scan can record the slices it finishes in Google Cloud Storage, so that a
+scan started again, after a crash, a redeploy or a restart of every node, only reads the
+slices no earlier run finished:
+
+```elixir
+{OffBroadway.Iceberg.Producer,
+ connection: MyApp.QuackDB,
+ table: "lake.betting.events",
+ snapshot_id: 123456789,
+ distribute: true,
+ checkpoint: [
+   job_id: "events-backfill-2026-11",
+   backend:
+     {OffBroadway.Iceberg.Checkpoint.GCS,
+      bucket: "my-checkpoints", prefix: "iceberg", auth: {:goth, MyApp.Goth}}
+ ]}
+```
+
+The GCS backend needs `{:req, "~> 0.7.5"}`, and `{:goth, "~> 1.4"}` for `auth: {:goth, name}`,
+in your dependencies. Goth finds Application Default Credentials, including those of GKE
+Workload Identity, so no key file is needed. Every record is an object of its own, created
+with `ifGenerationMatch=0` and never changed, so producers on any node can record the same
+slice at once without overwriting each other.
+
+- `:job_id` names the job: one scan of one snapshot. Every run of the job checks, before
+  reading a row, that it planned the same snapshot and slices as the first run, and fails
+  if it did not. Keep `:slice_rows` for the life of a job, and use a new job id to start
+  over.
+- A slice is recorded once every one of its batches was acknowledged successfully, and only
+  then counts as finished. A slice with failed batches is not recorded: the run reports it
+  in `:stop`, and the next run of the job reads it again.
+- A backend that cannot be reached fails the scan, with `:exception`. It is never taken for
+  a job with nothing finished, and a write that was not confirmed never counts as recorded.
+- Processing is still at least once: a slice can be processed and not recorded, if its
+  producer stops in between. Writes must be idempotent.
+
+For local development, point the backend at
+[fake-gcs-server](https://github.com/fsouza/fake-gcs-server) with
+`endpoint: "http://localhost:4443", auth: :none`. See "Checkpoints" in
+`OffBroadway.Iceberg.Producer` and `OffBroadway.Iceberg.Checkpoint.GCS` for the details,
+and `OffBroadway.Iceberg.Checkpoint` to record checkpoints elsewhere.
 
 ### Options
 
@@ -195,6 +243,8 @@ exactly.
   Broadway's batcher `:batch_size`, which counts messages.
 - `:distribute` - `true`, or `[slice_rows: rows]`, shares the scan between the producers of
   the pipeline on every connected node. See "Distributed scans" above.
+- `:checkpoint` - `[job_id: id, backend: {module, options}]` records finished slices, so
+  that the scan resumes. Requires `:distribute`. See "Checkpoints" above.
 
 See `OffBroadway.Iceberg.Producer` for the full reference.
 
@@ -266,8 +316,8 @@ batches. Other copies may have failed batches, which count in `:local_failed_bat
 
 Attach telemetry handlers before starting the pipeline, since a scan that fails early
 emits `:exception` right away. The events are the only record of the outcome: the producer
-stays idle whether the scan completed or failed. If you need the outcome later, for
-example to resume a job, persist it yourself.
+stays idle whether the scan completed or failed. If you need the outcome later, persist it
+yourself. To resume a scan, checkpoint it.
 
 Broadway has no way for a producer to stop its own pipeline. To stop it when the scan
 completes, handle the `:stop` event and call `Broadway.stop/1` from another process.
@@ -278,9 +328,9 @@ A query or connection error fails the scan: the producer logs it, emits the `:ex
 event and stays idle. It does not start the scan again, so the batches it emitted are not
 delivered twice.
 
-Progress is not persisted, though. If the producer crashes, Broadway restarts it and it
-scans the snapshot again from the start, and so does a pipeline you start again after a
-failure. Make downstream writes idempotent, for example keyed by the snapshot id and the
+Without [checkpoints](#checkpoints), progress is not persisted, though. If the producer
+crashes, Broadway restarts it and it scans the snapshot again from the start, and so does a
+pipeline you start again after a failure. Make downstream writes idempotent, for example keyed by the snapshot id and the
 row's key. This producer does not provide exactly-once processing.
 
 When the pipeline shuts down mid-scan, the producer stops its worker. The connection the
@@ -318,9 +368,9 @@ Unit tests run without DuckDB or Docker:
 mix test
 ```
 
-Integration tests start an Iceberg REST catalog with Docker Compose and a managed DuckDB
-2.0 server through QuackDB, which downloads DuckDB and the `iceberg` extension the first
-time:
+Integration tests start an Iceberg REST catalog and fake-gcs-server with Docker Compose,
+and a managed DuckDB 2.0 server through QuackDB, which downloads DuckDB and the `iceberg`
+extension the first time:
 
 ```shell
 mix test --only integration

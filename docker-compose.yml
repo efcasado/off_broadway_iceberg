@@ -14,3 +14,16 @@ services:
       - "./test/support/iceberg-rest:/etc/iceberg-rest:ro"
     ports:
       - "18181:8181"
+
+  # A GCS emulator for the checkpoint tests, with every object in memory. The bucket is
+  # created by the tests.
+  fake-gcs:
+    image: fsouza/fake-gcs-server:1.56.1@sha256:797ce226d62f947c009dc40246b30cfb456b8473d8241407f9d6f2c04e4d69ef
+    command: ["-scheme", "http", "-port", "4443", "-backend", "memory", "-public-host", "localhost:14443"]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:4443/storage/v1/b"]
+      interval: 1s
+      timeout: 5s
+      retries: 30
+    ports:
+      - "14443:4443"
