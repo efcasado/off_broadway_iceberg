@@ -183,7 +183,6 @@ SELECT * FROM lake.betting.events AT (VERSION => 1002);
 The producer reads every row this way. Before it reads any, it resolves `:snapshot_id` to
 one snapshot:
 
-- `:current` is the snapshot the `main` branch points at, from `iceberg_refs`.
 - An integer is that snapshot.
 - `{:as_of, datetime}` is the snapshot that was current at that time, from
   `iceberg_history`, the log of which snapshot was current when.
@@ -191,8 +190,9 @@ one snapshot:
 Pinning one snapshot is what lets several producers share a scan, and a scan resume.
 Suppose producer A planned the scan at snapshot 1002 and producer B at 1003. B would see
 `events-c.parquet`, which A knows nothing of, and they could not agree on which rows are
-left. That is why a distributed scan refuses `:current`: two nodes that resolve "current"
-a minute apart can get different snapshots.
+left. Every scan therefore requires a fixed snapshot id or as-of timestamp. `:current`
+is rejected: two nodes resolving "current" a minute apart can get different snapshots.
+Choose the value once for the job, including when it initially has only one producer.
 
 The other side of pinning: a pinned snapshot can be expired. A scan of a snapshot that
 was expired fails. It never reads another snapshot instead.
@@ -215,7 +215,7 @@ Reading File A directly with DuckDB's `read_parquet` could incorrectly return 10
 
 That is why this library never reads a data file by itself, even though it knows every
 path. Every read is a query on the Iceberg table, and DuckDB applies the delete files.
-When a distributed scan reads only some of the files, it names them with DuckDB's
+Each slice names its files with DuckDB's
 `filename` column:
 
 ```sql
@@ -223,7 +223,9 @@ SELECT * FROM lake.betting.events AT (VERSION => 1002)
 WHERE filename IN ('s3://lake/betting/events/data/events-b.parquet');
 ```
 
-DuckDB opens only that file, and still applies the deletes that refer to it. The
+DuckDB opens only that file, and still applies the deletes that refer to it. A physical
+column named `filename` would hide the virtual column, so the producer rejects such tables
+during planning, even if the projection omits that column. The
 integration tests cover the deletes DuckDB itself writes, which are position deletes.
 
 Read more: the spec's [row-level deletes](https://iceberg.apache.org/spec/#row-level-deletes).
@@ -256,6 +258,9 @@ explains several things in the library:
   literals, on the client. `:where` relies on that.
 
 ## Files and rows: sharing a scan
+
+For a detailed walkthrough of local and remote producers, process groups, ownership,
+and failures, see [How producers share a scan](distribution.md).
 
 Imagine eight Parquet files and four workers. We want each worker to have useful
 work without forcing it to read the entire table.
@@ -311,7 +316,9 @@ With 8 data files of 500,000 rows each, the scan has 4 slices of 2 files, and wi
 `:fetch_size` of 10,000, each slice makes at least 100 messages. A table stored in one huge file
 makes one slice, which only one producer can read.
 
-Every producer plans on its own. Since they all plan the same snapshot the same way, they
+A single producer reads every slice. Additional producers on this node or other connected
+nodes share those slices automatically; no distribution option is needed. Every producer
+plans on its own. Since they all plan the same snapshot the same way, they
 all get the same slices, in the same order, so a slice is known by its position. A
 SHA-256 fingerprint of the plan, which covers the slices and what the scan selects from
 them, shows that two producers really planned the same scan. Only producers with the same

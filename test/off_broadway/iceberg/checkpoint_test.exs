@@ -41,10 +41,8 @@ defmodule OffBroadway.Iceberg.CheckpointTest do
   end
 
   describe "options" do
-    test "require :distribute" do
-      assert_raise ArgumentError, ~r/requires :distribute with :checkpoint/, fn ->
-        prepare(connection: MyApp.QuackDB, table: "events", snapshot_id: 7, checkpoint: checkpoint("job", self()))
-      end
+    test "accepts checkpoints without an opt-in" do
+      assert {[], _opts} = prepare(scan_options(checkpoint: checkpoint("job", self())))
     end
 
     test "require a job id and a backend that implements the behaviour" do
@@ -58,21 +56,21 @@ defmodule OffBroadway.Iceberg.CheckpointTest do
              ~r/invalid options for OffBroadway.Iceberg.Test.Checkpoint: required :store option not found/},
             {[job_id: "job", backend: {GCS, bucket: "B", auth: :none}], ~r/:bucket/}
           ] do
-        assert_raise NimbleOptions.ValidationError, message, fn -> prepare(distributed(checkpoint: checkpoint)) end
+        assert_raise NimbleOptions.ValidationError, message, fn -> prepare(scan_options(checkpoint: checkpoint)) end
       end
     end
 
     test "reject job ids that cannot name a job" do
       for job_id <- ["", ".", "..", "a\nb", <<0>>, <<0xFF>>, String.duplicate("j", 129), :job, 42] do
         assert_raise NimbleOptions.ValidationError, ~r/:job_id/, fn ->
-          prepare(distributed(checkpoint: checkpoint(job_id, self())))
+          prepare(scan_options(checkpoint: checkpoint(job_id, self())))
         end
       end
     end
 
     test "accept job ids of any other characters" do
       for job_id <- ["events-backfill-2026-11", "a/b", "a b", "ü", "../x", String.duplicate("j", 128)] do
-        assert {[], _opts} = prepare(distributed(checkpoint: checkpoint(job_id, self())), 2)
+        assert {[], _opts} = prepare(scan_options(checkpoint: checkpoint(job_id, self())), 2)
       end
     end
   end
@@ -422,8 +420,8 @@ defmodule OffBroadway.Iceberg.CheckpointTest do
     Producer.prepare_for_start(__MODULE__, producer: [module: {Producer, producer_opts}, concurrency: concurrency])
   end
 
-  defp distributed(opts) do
-    Keyword.merge([connection: MyApp.QuackDB, table: "events", snapshot_id: 7, distribute: true], opts)
+  defp scan_options(opts) do
+    Keyword.merge([connection: MyApp.QuackDB, table: "events", snapshot_id: 7], opts)
   end
 
   defp checkpoint(job_id, store, backend_opts \\ []) do
@@ -448,7 +446,7 @@ defmodule OffBroadway.Iceberg.CheckpointTest do
           table: ctx.table,
           snapshot_id: Keyword.get(opts, :snapshot_id, 42),
           fetch_size: 5,
-          distribute: [slice_rows: 10],
+          slice_rows: 10,
           checkpoint: checkpoint(ctx.job_id, ctx.store, Keyword.get(opts, :backend, []))
         ],
         Keyword.get(opts, :producer, [])

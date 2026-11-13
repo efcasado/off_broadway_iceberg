@@ -5,15 +5,13 @@ defmodule OffBroadway.Iceberg.Scan do
   #
   # A QuackDB stream can only be read inside `DBConnection.run/3`, by the process that
   # checked the connection out, so the cursor cannot live in the producer without
-  # blocking it. This process checks out one connection for the whole scan and reads the
+  # blocking it. This process checks out one connection for the whole slice and reads the
   # stream, fetching a batch only once the producer has asked for one.
   #
-  # A scan reads either the whole snapshot or, with a `:slice` of `{:files, paths}`, the
-  # rows of those data files, and selects `:columns` and the rows that meet `:where` from
-  # them.
+  # A scan reads one slice's data files, selecting `:columns` and rows meeting `:where`.
   #
-  # Messages to the producer, in order: `{:snapshot, id | nil}`, any number of
-  # `{:batch, %QuackDB.Columns{}}`, then `:done` or `{:error, reason}`. Each is sent as
+  # Messages to the producer, in order: any number of `{:batch, %QuackDB.Columns{}}`,
+  # then `:done` or `{:error, reason}`. Each is sent as
   # `{OffBroadway.Iceberg.Scan, ref, event}`.
   #
   # `plan/3` starts a process of its own, which resolves the snapshot and divides its
@@ -24,7 +22,7 @@ defmodule OffBroadway.Iceberg.Scan do
   @plain_identifier ~r/\A[A-Za-z_][A-Za-z0-9_]*\z/
 
   @doc """
-  Starts the scan for `producer`, linked to the caller.
+  Starts reading a planned slice for `producer`, linked to the caller.
   """
   @spec start_link(pid(), reference(), keyword()) :: {:ok, pid()}
   def start_link(producer, ref, opts) do
@@ -32,7 +30,7 @@ defmodule OffBroadway.Iceberg.Scan do
   end
 
   @doc """
-  Plans a distributed scan for `producer`, linked to the caller: resolves the snapshot,
+  Plans a scan for `producer`, linked to the caller: resolves the snapshot,
   and divides its data files into slices of whole files, in path order, each with at
   least `:slice_rows` rows but the last. Files are never split.
   """
@@ -143,8 +141,8 @@ defmodule OffBroadway.Iceberg.Scan do
 
     if column do
       raise ArgumentError,
-            "cannot distribute a table with a column named #{inspect(column)}: it shadows DuckDB's " <>
-              "virtual filename column used to select slice files. Read it without :distribute"
+            "cannot scan a table with a column named #{inspect(column)}: it shadows DuckDB's " <>
+              "virtual filename column used to select slice files"
     end
   end
 
@@ -177,19 +175,15 @@ defmodule OffBroadway.Iceberg.Scan do
 
   defp scan(conn, producer, ref, opts) do
     table = opts |> Keyword.fetch!(:table) |> table_parts() |> quote_name()
-    snapshot_id = resolve_snapshot(conn, table, Keyword.fetch!(opts, :snapshot_id))
-    send(producer, {__MODULE__, ref, {:snapshot, snapshot_id}})
+    snapshot_id = Keyword.fetch!(opts, :snapshot_id)
+    # Running the query already fetches the first batch, so it waits for demand too.
+    credit = await_credit(ref, 0)
+    {statement, params} = select(table, opts, Keyword.fetch!(opts, :files))
 
-    if snapshot_id do
-      # Running the query already fetches the first batch, so it waits for demand too.
-      credit = await_credit(ref, 0)
-      {statement, params} = select(table, opts)
-
-      _unused_credit =
-        conn
-        |> QuackDB.columnar_batches(statement, [snapshot_id | params], max_rows: Keyword.fetch!(opts, :fetch_size))
-        |> Enum.reduce(credit, &deliver(&1, &2, producer, ref))
-    end
+    _unused_credit =
+      conn
+      |> QuackDB.columnar_batches(statement, [snapshot_id | params], max_rows: Keyword.fetch!(opts, :fetch_size))
+      |> Enum.reduce(credit, &deliver(&1, &2, producer, ref))
 
     :done
   end
@@ -198,8 +192,8 @@ defmodule OffBroadway.Iceberg.Scan do
   # select from the rows of the slice in a query of their own, so that no condition can
   # change which files the slice reads. DuckDB still pushes both into its Iceberg scan.
   # The condition already has its parameters written in.
-  defp select(table, opts) do
-    {filter, params} = slice_filter(Keyword.get(opts, :slice))
+  defp select(table, opts, files \\ nil) do
+    {filter, params} = slice_filter(files)
     rows = ["SELECT * FROM ", table, " AT (VERSION => ?)", filter]
 
     statement =
@@ -218,10 +212,11 @@ defmodule OffBroadway.Iceberg.Scan do
   # On lines of its own, so that a comment at the end of the condition ends with it.
   defp condition(where), do: [" WHERE (\n", where, "\n)"]
 
+  # The preflight selection check binds without reading files; actual reads require them.
   defp slice_filter(nil), do: {[], []}
 
   # DuckDB reads only the files named, and still applies their delete files.
-  defp slice_filter({:files, paths}) do
+  defp slice_filter(paths) do
     {[" WHERE filename IN (", Enum.map_intersperse(paths, ", ", fn _path -> "?" end), ")"], paths}
   end
 
@@ -239,18 +234,6 @@ defmodule OffBroadway.Iceberg.Scan do
            "SELECT snapshot_id FROM iceberg_history(?) WHERE made_current_at <= ? ORDER BY made_current_at DESC LIMIT 1",
            [table, as_of]
          ) do
-      %{rows: [[snapshot_id]]} -> snapshot_id
-      %{rows: []} -> nil
-    end
-  end
-
-  defp resolve_snapshot(conn, table, :current) do
-    # iceberg_refs/1 reads a name it cannot resolve as a file path, and the error it then
-    # raises hides the actual problem. Binding the table first reports a missing table.
-    QuackDB.query!(conn, ["SELECT * FROM ", table, " LIMIT 0"])
-
-    # The main branch is the table's current snapshot. A table with no snapshots has none.
-    case QuackDB.query!(conn, "SELECT snapshot_id FROM iceberg_refs(?) WHERE name = 'main'", [table]) do
       %{rows: [[snapshot_id]]} -> snapshot_id
       %{rows: []} -> nil
     end

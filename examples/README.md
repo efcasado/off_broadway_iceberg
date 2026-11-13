@@ -10,7 +10,7 @@ It demonstrates:
 
 - DuckDB managed by QuackDB under the script's own supervision tree.
 - Attaching an Iceberg REST catalog before the pipeline starts.
-- Reading the table's current snapshot, pinned for the whole scan.
+- Reading a snapshot selected by one fixed as-of timestamp for the run.
 - `QuackDB.Columns` batches of at most 5,000 rows, processed with backpressure by two
   processors that each take one batch at a time.
 - Telemetry handlers that tell a completed scan from a failed one, and an exit status
@@ -57,10 +57,10 @@ Catalog attached.
 Reading pubdata.environment.earthquakes
 Snapshot: 5964070490105136742
 
-Batch 0: 5000 rows, strongest M8.0 2000 New Ireland Earthquake
-Batch 1: 5000 rows, strongest M8.4 6 km SSW of Atico, Peru
+Slice 0, batch 0: 5000 rows, strongest M8.0 2000 New Ireland Earthquake
+Slice 0, batch 1: 5000 rows, strongest M8.4 6 km SSW of Atico, Peru
 ...
-Batch 39: 4650 rows, strongest M7.8 25 km SW of Kablalan, Philippines
+Slice 0, batch 39: 4650 rows, strongest M7.8 25 km SW of Kablalan, Philippines
 
 Completed.
 Rows processed: 188490
@@ -80,8 +80,11 @@ to it. The pipeline is the next child. Before starting Broadway, it installs and
 extensions and attaches the catalog as `pubdata`. Stopping the supervisor stops the pipeline,
 then the pool, then DuckDB.
 
-The producer resolves the snapshot the table's `main` branch points at, prints it in
-`Snapshot:`, and reads every row at that snapshot. If the provider publishes new data while
+The script chooses an as-of timestamp once, when it builds its supervision tree. The
+producer resolves the snapshot that was current then, prints it in `Snapshot:`, and
+reads every slice at that snapshot. The timestamp is kept if DuckDB restarts the pipeline.
+These examples run one app instance; a multi-instance job must pass the same configured
+snapshot id or timestamp to every instance. If the provider publishes new data while
 the scan runs, the scan does not see it. The provider does republish its tables, so snapshot
 ids change over time and old ones expire. Pass `snapshot_id:` to pin a specific one, but
 expect it to stop working once it expires.
@@ -153,8 +156,8 @@ The script creates two tables if they do not exist: `earthquakes`, keyed by `eve
 Reading pubdata.environment.earthquakes
 Snapshot: 5964070490105136742
 
-Batch 1: 5000 rows, 5000 written, 0 rejected
-Batch 0: 5000 rows, 5000 written, 0 rejected
+Slice 0, batch 1: 5000 rows, 5000 written, 0 rejected
+Slice 0, batch 0: 5000 rows, 5000 written, 0 rejected
 ...
 
 Completed.
@@ -210,7 +213,7 @@ stopped midway is resumed by the next one.
 
 It demonstrates:
 
-- A distributed scan of a single producer, which checkpoints need.
+- A single producer using the same sliced execution model as a cluster.
 - `OffBroadway.Iceberg.Checkpoint.GCS` pointed at an emulator, without authentication.
 - A job named after the snapshot it reads, which it pins.
 - The `[:off_broadway_iceberg, :checkpoint, ...]` telemetry events.

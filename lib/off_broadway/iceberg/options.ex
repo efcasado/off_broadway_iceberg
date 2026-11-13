@@ -2,7 +2,6 @@ defmodule OffBroadway.Iceberg.Options do
   @moduledoc false
 
   alias OffBroadway.Iceberg.Checkpoint
-  alias OffBroadway.Iceberg.Producer
   alias OffBroadway.Iceberg.Scan
 
   @max_snapshot_id 0x7FFFFFFFFFFFFFFF
@@ -33,12 +32,11 @@ defmodule OffBroadway.Iceberg.Options do
     ],
     snapshot_id: [
       type: {:custom, __MODULE__, :validate_snapshot_id, []},
-      default: :current,
+      required: true,
       doc: """
-      The snapshot to read. `:current` resolves the snapshot the table's `main` branch
-      points at, once, when the scan starts. An integer reads that snapshot.
-      `{:as_of, datetime}` reads the snapshot that was the table's current one at that
-      time.
+      The fixed snapshot to read: an integer id, or `{:as_of, datetime}` for the snapshot
+      that was current at that time. Use the same value on every node. `:current` is not
+      accepted, since producers starting at different times could resolve different snapshots.
       """
     ],
     fetch_size: [
@@ -68,15 +66,14 @@ defmodule OffBroadway.Iceberg.Options do
       calling `now()`. See "Selecting columns and rows" below.
       """
     ],
-    distribute: [
-      type: {:or, [:boolean, :keyword_list]},
-      default: false,
+    slice_rows: [
+      type: :pos_integer,
+      default: @slice_rows,
       doc: """
-      Shares the scan between the producers of this pipeline on every connected node.
-      `true`, or `[slice_rows: rows]` to set how many rows a slice holds at least (default
-      `#{@slice_rows}`): small data files are grouped into slices of that many rows, and
-      files are never split. See "Distributed scans" below. Requires an integer
-      or `{:as_of, datetime}` `:snapshot_id`.
+      The target number of rows per slice. Consecutive data files are grouped until their
+      record counts reach this target; the final slice may be smaller. Files are never
+      split, so a slice can exceed the target. The count is before `:where` and deletes
+      apply; this is separate from `:fetch_size` and does not bound memory.
       """
     ],
     checkpoint: [
@@ -102,8 +99,7 @@ defmodule OffBroadway.Iceberg.Options do
       ],
       doc: """
       Records every slice finished without failed batches, so that the scan, started
-      again with the same `:job_id`, does not read it again. Requires `:distribute`. See
-      "Checkpoints" below.
+      again with the same `:job_id`, does not read it again. See "Checkpoints" below.
       """
     ]
   ]
@@ -114,22 +110,7 @@ defmodule OffBroadway.Iceberg.Options do
   def validate!(opts) do
     # Broadway injects :broadway (pipeline name and stage index) into the producer's options.
     {_broadway, opts} = Keyword.pop(opts, :broadway)
-    opts = NimbleOptions.validate!(opts, @opts_schema)
-    opts = Keyword.update!(opts, :distribute, &validate_distribute!/1)
-
-    if opts[:checkpoint] && !opts[:distribute] do
-      raise ArgumentError,
-            "#{inspect(Producer)} requires :distribute with :checkpoint, since a checkpoint records " <>
-              "slices, which only a distributed scan has. A single producer is a distributed scan of one"
-    end
-
-    if opts[:distribute] && opts[:snapshot_id] == :current do
-      raise ArgumentError,
-            "#{inspect(Producer)} requires an integer or {:as_of, datetime} :snapshot_id with :distribute, " <>
-              "so that every producer reads the same snapshot"
-    end
-
-    opts
+    NimbleOptions.validate!(opts, @opts_schema)
   end
 
   @doc false
@@ -155,8 +136,6 @@ defmodule OffBroadway.Iceberg.Options do
   end
 
   @doc false
-  def validate_snapshot_id(:current), do: {:ok, :current}
-
   def validate_snapshot_id(snapshot_id) when is_integer(snapshot_id) and snapshot_id in 0..@max_snapshot_id,
     do: {:ok, snapshot_id}
 
@@ -164,7 +143,7 @@ defmodule OffBroadway.Iceberg.Options do
 
   def validate_snapshot_id(snapshot_id) do
     {:error,
-     "expected :current, {:as_of, datetime} or a snapshot id between 0 and #{@max_snapshot_id}, " <>
+     "expected {:as_of, datetime} or a snapshot id between 0 and #{@max_snapshot_id}, " <>
        "got: #{inspect(snapshot_id)}"}
   end
 
@@ -247,17 +226,5 @@ defmodule OffBroadway.Iceberg.Options do
 
   def validate_backend(_backend) do
     {:error, "expected {module, options}, with a module that implements #{inspect(Checkpoint)}"}
-  end
-
-  defp validate_distribute!(false), do: nil
-  defp validate_distribute!(true), do: [slice_rows: @slice_rows]
-
-  defp validate_distribute!(distribute) do
-    NimbleOptions.validate!(distribute, slice_rows: [type: :pos_integer, default: @slice_rows])
-  rescue
-    error in NimbleOptions.ValidationError ->
-      reraise NimbleOptions.ValidationError,
-              [message: "invalid value for :distribute option: #{Exception.message(error)}", key: :distribute],
-              __STACKTRACE__
   end
 end

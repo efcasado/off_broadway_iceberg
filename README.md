@@ -81,7 +81,7 @@ defmodule MyApp.IcebergBackfill do
           {OffBroadway.Iceberg.Producer,
            connection: MyApp.QuackDB,
            table: "lake.betting.events",
-           snapshot_id: :current,
+           snapshot_id: {:as_of, ~U[2026-11-12 00:00:00Z]},
            fetch_size: 10_000},
         concurrency: 1
       ],
@@ -104,8 +104,10 @@ end
 [Iceberg documentation](https://duckdb.org/docs/stable/extensions/iceberg/overview) for
 catalogs that need credentials and for object storage secrets.
 
-Without `:distribute` (see below), the producer requires `producer: [concurrency: 1]`, since
-every producer stage would scan the whole snapshot. Scale out with the processors instead.
+Every scan is sliced and coordinated, even with one producer on one node. Increase
+producer concurrency or add connected app instances to share the work. Size each local
+QuackDB pool for its concurrent producer stages. `slice_rows: 1_000_000` is the default;
+set it directly in the producer options to change the target.
 
 ### One DuckDB per pipeline
 
@@ -172,19 +174,22 @@ and keep sharing it as an autoscaler adds and removes nodes:
  connection: MyApp.QuackDB,
  table: "lake.betting.events",
  snapshot_id: {:as_of, ~U[2026-11-12 00:00:00Z]},
- distribute: true}
+ slice_rows: 1_000_000}
 ```
 
 Each producer plans the snapshot's data files into slices of at least a million rows,
-except the last (`distribute: [slice_rows: rows]` changes the target). Files are never
+except the last (`slice_rows: rows` changes the target). Files are never
 split, so a table stored in one large file can only use one producer. Members find each
 other through OTP's `:pg`, assign slices with rendezvous hashing, and share progress.
 
 The nodes must be connected and use the same pipeline name, table, selection and fixed
-snapshot. `:current` is not supported here. Membership changes and network partitions
+snapshot. `:current` is not supported. Membership changes and network partitions
 can cause slices to be read more than once; a full cluster restart loses progress unless
 the scan is checkpointed. See "Distributed scans" in `OffBroadway.Iceberg.Producer` for
 membership and completion guarantees.
+
+[How producers share a scan](guides/distribution.md) explains local stages, app replicas,
+`:pg` membership, slice ownership, checkpoints, and failures with a worked example.
 
 ### Checkpoints
 
@@ -192,7 +197,7 @@ membership and completion guarantees.
 >
 > Checkpoints are new. Their behavior may change.
 
-A distributed scan can record the slices it finishes in Google Cloud Storage, so that a
+A scan can record the slices it finishes in Google Cloud Storage, so that a
 scan started again, after a crash, a redeploy or a restart of every node, only reads the
 slices no earlier run finished:
 
@@ -201,7 +206,6 @@ slices no earlier run finished:
  connection: MyApp.QuackDB,
  table: "lake.betting.events",
  snapshot_id: 123456789,
- distribute: true,
  checkpoint: [
    job_id: "events-backfill-2026-11",
    backend:
@@ -226,18 +230,22 @@ emulator, see [the checkpointed example](examples/checkpointed_backfill.exs).
 ### Options
 
 See `OffBroadway.Iceberg.Producer.start_link/1` for the full option reference. `:connection`
-and `:table` are required. The table can be a dotted name such as `"lake.betting.events"`,
-or a list such as `["lake", "betting", "my-events"]` for names containing punctuation.
+and `:table` are required, along with a fixed `:snapshot_id`. The table can be a dotted
+name such as `"lake.betting.events"`, or a list such as `["lake", "betting", "my-events"]`
+for names containing punctuation.
 
 ## Snapshots
 
-With `snapshot_id: :current`, the producer resolves the snapshot the table's `main` branch
-points at, once, before the first fetch, and reads every row with
-`AT (VERSION => snapshot_id)`. That is the table's current snapshot, which after a rollback
-is not necessarily the newest one. With an explicit id, the producer reads that snapshot.
+`:snapshot_id` is required. Pass an integer id or a fixed `{:as_of, datetime}` shared by
+all producers and app instances. An as-of timestamp resolves through the table's snapshot
+history, including rollbacks. A timestamp before the first snapshot yields no messages.
 
-Either way the scan is pinned: rows committed while it runs are not read. A table with no
-snapshots yields no messages.
+Choose the value once in your job configuration. `:current` and an omitted snapshot are
+rejected, since producers resolving "current" independently might read different versions.
+Every slice uses `AT (VERSION => snapshot_id)`, so later commits are never read.
+
+Tables with a physical column named `filename`, regardless of case, are rejected during
+planning: that name would shadow DuckDB's virtual column used to select slice files.
 
 ## Batches
 
@@ -247,7 +255,7 @@ list per column. Read columns with `QuackDB.Columns.get/3`, or use
 
 Messages hold at most `:fetch_size` rows (default `10_000`); this is separate from Broadway's
 batcher `:batch_size`, which counts messages. Metadata includes `:table`, `:snapshot_id`,
-`:batch_index` and, for distributed scans, `:slice`. Batch indexes start at zero within
+`:batch_index` and `:slice`. Batch indexes start at zero within
 each slice.
 
 ## Backpressure
@@ -270,8 +278,8 @@ batches are acknowledged. It emits these telemetry events:
   `:rows`, `:failed_batches` and `:local_failed_batches`.
 - `[:off_broadway_iceberg, :scan, :exception]` when the scan fails.
 
-`failed_batches: 0` on `:stop` means every row was processed successfully. In a distributed
-scan, it counts one copy of each slice; `:local_failed_batches` includes failures in other
+`failed_batches: 0` on `:stop` means every row was processed successfully. The counts
+cover one copy of each slice; `:local_failed_batches` includes failures in other
 copies this producer emitted. The producer reference defines the measurements and exact
 completion guarantees.
 

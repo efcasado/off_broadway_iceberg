@@ -14,13 +14,12 @@ defmodule OffBroadway.Iceberg.Test.FakeConnection do
 
   Script keys:
 
-  - `:refs` - rows returned by the `iceberg_refs` query (default `[[42]]`)
   - `:history` - rows returned by the `iceberg_history` query (default `[[42]]`)
   - `:columns` - column names returned when binding a query (default `["id"]`)
   - `:rows` - rows of the scan, as one-element lists (default `[]`)
   - `:files` - data files of the snapshot, as `{path, rows}`, for distributed scans. The
     `iceberg_files` query lists them, and a scan of some files gets their rows
-  - `:fail` - `{:bind | :refs | :declare, exception}` or `{{:fetch, n}, exception}`
+  - `:fail` - `{:bind | :history | :plan | :declare, exception}` or `{{:fetch, n}, exception}`
     makes that call fail; `{{:fetch, n}, {:disconnect, exception}}` also disconnects
   """
 
@@ -80,11 +79,8 @@ defmodule OffBroadway.Iceberg.Test.FakeConnection do
         String.contains?(query.statement, "LIMIT 0") ->
           respond(state, :bind, result(Map.get(state.script, :columns, ["id"]), []))
 
-        String.contains?(query.statement, "iceberg_refs") ->
-          respond(state, :refs, result(["snapshot_id"], Map.get(state.script, :refs, [[42]])))
-
         String.contains?(query.statement, "iceberg_files") ->
-          files = for {path, rows} <- Map.get(state.script, :files, []), do: [path, length(rows)]
+          files = for {path, rows} <- files(state.script), do: [path, length(rows)]
           respond(state, :plan, result(["file_path", "record_count"], files))
 
         String.contains?(query.statement, "iceberg_history") ->
@@ -136,11 +132,18 @@ defmodule OffBroadway.Iceberg.Test.FakeConnection do
     {:ok, result([], []), %{state | cursors: Map.delete(state.cursors, cursor)}}
   end
 
-  defp rows(script, [_snapshot_id]), do: Map.get(script, :rows, [])
-
   defp rows(script, [_snapshot_id | paths]) do
-    files = Map.new(Map.get(script, :files, []))
+    files = Map.new(files(script))
     Enum.flat_map(paths, &Map.fetch!(files, &1))
+  end
+
+  defp files(script) do
+    Map.get_lazy(script, :files, fn ->
+      case Map.get(script, :rows, []) do
+        [] -> []
+        rows -> [{"file-00", rows}]
+      end
+    end)
   end
 
   defp respond(state, call, ok) do

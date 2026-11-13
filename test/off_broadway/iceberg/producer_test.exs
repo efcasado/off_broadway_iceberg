@@ -13,12 +13,12 @@ defmodule OffBroadway.Iceberg.ProducerTest do
   # DBConnection logs every disconnect the tests cause.
   @moduletag :capture_log
 
-  @scan_statement_suffix " AT (VERSION => ?)"
+  @scan_statement_suffix " AT (VERSION => ?) WHERE filename IN (?)"
 
   describe "options" do
     test "accept tables, snapshots and connections in every supported form" do
       for table <- ["events", "betting.events", "lake.betting.events", ["lake", "odd \"name\"", "t.x"], ["t"]],
-          snapshot_id <- [:current, 0, 0x7FFFFFFFFFFFFFFF],
+          snapshot_id <- [0, 0x7FFFFFFFFFFFFFFF, {:as_of, ~U[2026-11-12 00:00:00Z]}],
           connection <- [MyApp.QuackDB, self(), {:global, :pool}, {:via, Registry, {MyApp.Registry, :pool}}] do
         assert {[], _opts} = prepare(connection: connection, table: table, snapshot_id: snapshot_id)
       end
@@ -58,8 +58,8 @@ defmodule OffBroadway.Iceberg.ProducerTest do
       end
     end
 
-    test "reject snapshot ids that are not :current or a 64-bit snapshot id" do
-      for snapshot_id <- [-1, 0x8000000000000000, "42", 4.2, :latest, nil] do
+    test "reject snapshot ids that are not fixed ids or timestamps" do
+      for snapshot_id <- [-1, 0x8000000000000000, "42", 4.2, :current, :latest, nil] do
         assert_raise NimbleOptions.ValidationError, ~r/:snapshot_id/, fn ->
           prepare(connection: MyApp.QuackDB, table: "events", snapshot_id: snapshot_id)
         end
@@ -131,10 +131,16 @@ defmodule OffBroadway.Iceberg.ProducerTest do
       end
     end
 
-    test "reject producer concurrency other than 1" do
-      assert_raise ArgumentError, ~r/requires producer concurrency 1 without :distribute, got: 2/, fn ->
-        prepare([connection: MyApp.QuackDB, table: "events"], 2)
+    test "requires an explicit snapshot" do
+      assert_raise NimbleOptions.ValidationError, ~r/required :snapshot_id option not found/, fn ->
+        Producer.prepare_for_start(Pipeline,
+          producer: [module: {Producer, connection: MyApp.QuackDB, table: "events"}]
+        )
       end
+    end
+
+    test "allows multiple producer stages without an opt-in" do
+      assert {[], _opts} = prepare([connection: MyApp.QuackDB, table: "events"], 4)
     end
 
     test "make Broadway fail to start a pipeline with invalid options" do
@@ -150,18 +156,17 @@ defmodule OffBroadway.Iceberg.ProducerTest do
   end
 
   describe "queries" do
-    test "pin the snapshot of the main branch for :current, then scan it" do
+    test "plans the fixed snapshot before waiting for demand" do
       pool = start_pool(rows: rows(3))
       %{consumer: consumer} = start_producer(pool, table: "lake.betting.events")
 
       quoted = ~s("lake"."betting"."events")
-      assert_receive {:fake, {:query, statement, []}}
-      assert statement == "SELECT * FROM #{quoted} LIMIT 0"
-      assert_receive {:fake, {:query, "SELECT snapshot_id FROM iceberg_refs(?) WHERE name = 'main'", [^quoted]}}
+      assert_receive {:fake, {:query, statement, [42]}}
+      assert statement == "SELECT * FROM #{quoted} AT (VERSION => ?) LIMIT 0"
+      assert_receive {:fake, {:query, "SELECT file_path, record_count FROM iceberg_files" <> _, [^quoted, 42]}}
 
       ManualConsumer.ask(consumer, 1)
-
-      assert_receive {:fake, {:declare, statement, [42], 10_000}}
+      assert_receive {:fake, {:declare, statement, [42, "file-00"], 10_000}}
       assert statement == "SELECT * FROM #{quoted}" <> @scan_statement_suffix
     end
 
@@ -171,9 +176,9 @@ defmodule OffBroadway.Iceberg.ProducerTest do
 
       ManualConsumer.ask(consumer, 1)
 
-      assert_receive {:fake, {:declare, statement, [7], 10_000}}
+      assert_receive {:fake, {:declare, statement, [7, "file-00"], 10_000}}
       assert statement == ~s(SELECT * FROM "lake"."odd ""name"""."t.x") <> @scan_statement_suffix
-      refute_received {:fake, {:query, _statement, _params}}
+      refute_received {:fake, {:query, "SELECT snapshot_id" <> _, _params}}
     end
 
     test "select columns and rows from the snapshot, with the params written in" do
@@ -189,10 +194,10 @@ defmodule OffBroadway.Iceberg.ProducerTest do
 
       ManualConsumer.ask(consumer, 1)
 
-      assert_receive {:fake, {:declare, statement, [7], 10_000}}
+      assert_receive {:fake, {:declare, statement, [7, "file-00"], 10_000}}
 
       assert statement ==
-               ~s|SELECT "id", "odd ""name""" FROM (SELECT * FROM "events" AT (VERSION => ?)) | <>
+               ~s|SELECT "id", "odd ""name""" FROM (SELECT * FROM "events" AT (VERSION => ?) WHERE filename IN (?)) | <>
                  ~s|WHERE (\nid > 1 AND name <> 'o''brien' -- not 'x'\n)|
     end
 
@@ -207,8 +212,10 @@ defmodule OffBroadway.Iceberg.ProducerTest do
         ManualConsumer.ask(consumer, 1)
 
         {columns, condition} = selection
-        assert_receive {:fake, {:declare, statement, [7], 10_000}}
-        assert statement == ~s|SELECT #{columns} FROM (SELECT * FROM "#{table}" AT (VERSION => ?))#{condition}|
+        assert_receive {:fake, {:declare, statement, [7, "file-00"], 10_000}}
+
+        assert statement ==
+                 ~s|SELECT #{columns} FROM (SELECT * FROM "#{table}" AT (VERSION => ?) WHERE filename IN (?))#{condition}|
       end
     end
   end
@@ -265,9 +272,9 @@ defmodule OffBroadway.Iceberg.ProducerTest do
       assert Enum.flat_map(messages, &QuackDB.Columns.get(&1.data, "id")) == Enum.to_list(0..24)
 
       assert Enum.map(messages, & &1.metadata) == [
-               %{table: table, snapshot_id: 42, batch_index: 0},
-               %{table: table, snapshot_id: 42, batch_index: 1},
-               %{table: table, snapshot_id: 42, batch_index: 2}
+               %{table: table, snapshot_id: 42, slice: 0, batch_index: 0},
+               %{table: table, snapshot_id: 42, slice: 0, batch_index: 1},
+               %{table: table, snapshot_id: 42, slice: 0, batch_index: 2}
              ]
 
       assert %QuackDB.Columns{names: ["id"]} = hd(messages).data
@@ -294,8 +301,8 @@ defmodule OffBroadway.Iceberg.ProducerTest do
     end
 
     test "are not fetched for a table without snapshots" do
-      pool = start_pool(refs: [])
-      %{consumer: consumer, table: table} = start_producer(pool)
+      pool = start_pool(history: [])
+      %{consumer: consumer, table: table} = start_producer(pool, snapshot_id: {:as_of, ~U[2020-01-01 00:00:00Z]})
 
       ManualConsumer.ask(consumer, 10)
 
@@ -359,7 +366,9 @@ defmodule OffBroadway.Iceberg.ProducerTest do
                           %{failed_batches: 1, local_failed_batches: 1, batches: 2}, _}
         end)
 
-      assert log =~ "1 batches of #{inspect(table)} at snapshot 42 failed and will not be retried: [1]"
+      assert log =~
+               "1 batches of slice 0 of 1 (1 data files) of #{inspect(table)} at snapshot 42 failed and will not be retried: [1]"
+
       refute_received {:messages, _messages}
     end
 
@@ -400,7 +409,7 @@ defmodule OffBroadway.Iceberg.ProducerTest do
 
     test "a query error fails the scan and is not retried" do
       error = %QuackDB.Error{message: "Invalid Configuration Error: Could not find snapshot with id 7"}
-      pool = start_pool(fail: {:declare, error})
+      pool = start_pool(rows: rows(3), fail: {:declare, error})
 
       capture_log(fn ->
         %{producer: producer, consumer: consumer} = start_producer(pool, snapshot_id: 7)
@@ -482,7 +491,7 @@ defmodule OffBroadway.Iceberg.ProducerTest do
 
     test "stopping the producer normally mid-scan stops the worker too" do
       pool = start_pool(rows: rows(30))
-      {:ok, producer} = GenStage.start(Producer, connection: pool, table: unique_table(), fetch_size: 10)
+      {:ok, producer} = GenStage.start(Producer, connection: pool, table: unique_table(), snapshot_id: 42, fetch_size: 10)
       {:ok, consumer} = ManualConsumer.start_link(producer)
 
       ManualConsumer.ask(consumer, 1)
@@ -509,7 +518,8 @@ defmodule OffBroadway.Iceberg.ProducerTest do
 
       # Broadway.stop/1 stops the pipeline normally, which the test supervisor would restart.
       start_supervised!(
-        {Pipeline, name: name, handler: handler, producer: [connection: pool, table: "events", fetch_size: 10]},
+        {Pipeline,
+         name: name, handler: handler, producer: [connection: pool, table: "events", snapshot_id: 42, fetch_size: 10]},
         restart: :temporary
       )
 
@@ -576,7 +586,10 @@ defmodule OffBroadway.Iceberg.ProducerTest do
 
       start_supervised!(
         {Pipeline,
-         name: name, test: self(), processor_concurrency: 3, producer: [connection: pool, table: table, fetch_size: 10]}
+         name: name,
+         test: self(),
+         processor_concurrency: 3,
+         producer: [connection: pool, table: table, snapshot_id: 42, fetch_size: 10]}
       )
 
       assert_receive {:telemetry, [:off_broadway_iceberg, :scan, :stop], measurements, %{name: ^name}}, 5_000
@@ -601,7 +614,7 @@ defmodule OffBroadway.Iceberg.ProducerTest do
         message -> message
       end
 
-      producer = [connection: pool, table: table, fetch_size: 10]
+      producer = [connection: pool, table: table, snapshot_id: 42, fetch_size: 10]
 
       log =
         capture_log(fn ->
@@ -615,6 +628,7 @@ defmodule OffBroadway.Iceberg.ProducerTest do
   end
 
   defp prepare(producer_opts, concurrency \\ 1) do
+    producer_opts = Keyword.put_new(producer_opts, :snapshot_id, 42)
     Producer.prepare_for_start(Pipeline, producer: [module: {Producer, producer_opts}, concurrency: concurrency])
   end
 
@@ -630,7 +644,9 @@ defmodule OffBroadway.Iceberg.ProducerTest do
     table = Keyword.get(opts, :table, unique_table())
     Telemetry.attach_scan(table)
 
-    producer = start_supervised!({Producer, Keyword.merge([connection: pool, table: table], opts)}, id: id)
+    producer =
+      start_supervised!({Producer, Keyword.merge([connection: pool, table: table, snapshot_id: 42], opts)}, id: id)
+
     {:ok, consumer} = ManualConsumer.start_link(producer)
 
     %{producer: producer, consumer: consumer, table: table}

@@ -13,6 +13,7 @@ defmodule OffBroadway.Iceberg.Test.Member do
   alias OffBroadway.Iceberg.Producer
   alias OffBroadway.Iceberg.Test.FakeConnection
   alias OffBroadway.Iceberg.Test.ManualConsumer
+  alias OffBroadway.Iceberg.Test.Pipeline
   alias OffBroadway.Iceberg.Test.Telemetry
 
   @events [
@@ -24,7 +25,7 @@ defmodule OffBroadway.Iceberg.Test.Member do
   @doc """
   Starts the member, tagging what it forwards with `tag`. Options: `:files`, the data
   files of the fake database, `:demand` (default 1_000), and the producer's `:table`,
-  `:snapshot_id`, `:fetch_size` and `:distribute`.
+  `:snapshot_id`, `:fetch_size` and `:slice_rows`.
   """
   def start(test, tag, opts) do
     owner = self()
@@ -37,13 +38,62 @@ defmodule OffBroadway.Iceberg.Test.Member do
         :telemetry.attach_many(id, @events, &Telemetry.handle_event/4, {test, &(&1.table == table)})
 
         {:ok, pool} = FakeConnection.start_link(test: test, script: [files: Keyword.fetch!(opts, :files)], pool_size: 1)
-        producer_opts = Keyword.take(opts, [:table, :snapshot_id, :fetch_size, :distribute])
+        producer_opts = Keyword.take(opts, [:table, :snapshot_id, :fetch_size, :slice_rows])
         {:ok, producer} = GenStage.start_link(Producer, [connection: pool] ++ producer_opts)
         {:ok, consumer} = ManualConsumer.start_link(producer, test: test, tag: tag, ack: true)
         demand = Keyword.get(opts, :demand, 1_000)
         if demand > 0, do: ManualConsumer.ask(consumer, demand)
         send(owner, {__MODULE__, :started})
         serve(consumer, id)
+      end)
+
+    receive do
+      {__MODULE__, :started} -> holder
+    end
+  end
+
+  @doc "Starts a named Broadway pipeline whose messages wait for the test to send :continue."
+  def start_pipeline(test, tag, opts) do
+    owner = self()
+
+    holder =
+      spawn(fn ->
+        name = Keyword.fetch!(opts, :name)
+        concurrency = Keyword.fetch!(opts, :producer_concurrency)
+        id = {__MODULE__, name}
+        :telemetry.attach_many(id, @events, &Telemetry.handle_event/4, {test, &(&1.name == name)})
+
+        {:ok, pool} =
+          FakeConnection.start_link(test: test, script: [files: Keyword.fetch!(opts, :files)], pool_size: concurrency)
+
+        handler = fn message ->
+          send(test, {:handled, tag, message, self()})
+
+          receive do
+            :continue -> message
+          after
+            10_000 -> raise "the test did not release a pipeline message"
+          end
+        end
+
+        producer = [connection: pool] ++ Keyword.take(opts, [:table, :snapshot_id, :fetch_size, :slice_rows])
+
+        {:ok, _pipeline} =
+          Pipeline.start_link(
+            name: name,
+            handler: handler,
+            producer: producer,
+            producer_concurrency: concurrency,
+            processor_concurrency: concurrency
+          )
+
+        send(owner, {__MODULE__, :started})
+
+        receive do
+          :stop ->
+            :telemetry.detach(id)
+            exit(:shutdown)
+        end
       end)
 
     receive do

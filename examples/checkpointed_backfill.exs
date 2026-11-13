@@ -61,7 +61,7 @@ defmodule CheckpointedBackfill.Pipeline do
            table: @table,
            snapshot_id: snapshot_id,
            fetch_size: 1_000,
-           distribute: [slice_rows: 1],
+           slice_rows: 1,
            checkpoint: [
              job_id: "admin-areas-#{snapshot_id}",
              backend:

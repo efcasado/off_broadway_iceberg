@@ -110,7 +110,7 @@ defmodule OffBroadway.Iceberg.Integration.CheckpointTest do
         table: table,
         snapshot_id: snapshot,
         fetch_size: 500,
-        distribute: [slice_rows: 1_250],
+        slice_rows: 1_250,
         checkpoint: [job_id: job_id, backend: {GCS, backend}]
       ]
 
