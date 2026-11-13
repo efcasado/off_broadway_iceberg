@@ -23,6 +23,7 @@ defmodule OffBroadway.Iceberg.Producer do
 
   alias Broadway.CallerAcknowledger
   alias Broadway.Message
+  alias OffBroadway.Iceberg.Checkpoint
   alias OffBroadway.Iceberg.Distribution
   alias OffBroadway.Iceberg.Scan
 
@@ -30,6 +31,7 @@ defmodule OffBroadway.Iceberg.Producer do
 
   @max_snapshot_id 0x7FFFFFFFFFFFFFFF
   @slice_rows 1_000_000
+  @max_job_id_bytes 128
 
   @opts_schema [
     connection: [
@@ -80,6 +82,33 @@ defmodule OffBroadway.Iceberg.Producer do
       `#{@slice_rows}`): small data files are grouped into slices of that many rows, and
       larger files make a slice each. See "Distributed scans" below. Requires an integer
       or `{:as_of, datetime}` `:snapshot_id`.
+      """
+    ],
+    checkpoint: [
+      type: :keyword_list,
+      keys: [
+        job_id: [
+          type: {:custom, __MODULE__, :validate_job_id, []},
+          required: true,
+          doc: """
+          Names the job, the same on every node and every run, such as
+          `"events-backfill-2026-11"`. Runs with the same job id resume each other's
+          progress. A string of 1 to #{@max_job_id_bytes} bytes, other than `"."` and `".."`.
+          """
+        ],
+        backend: [
+          type: {:custom, __MODULE__, :validate_backend, []},
+          required: true,
+          doc: """
+          `{module, options}`, a module that implements `OffBroadway.Iceberg.Checkpoint`,
+          such as `OffBroadway.Iceberg.Checkpoint.GCS`, and its options.
+          """
+        ]
+      ],
+      doc: """
+      Records every slice finished without failed batches, so that the scan, started
+      again with the same `:job_id`, does not read it again. Requires `:distribute`. See
+      "Checkpoints" below.
       """
     ]
   ]
@@ -196,11 +225,11 @@ defmodule OffBroadway.Iceberg.Producer do
   `[:off_broadway_iceberg, :scan, :exception]` and stays idle, without starting over.
   The batches emitted before the error are still processed and acknowledged.
 
-  Progress is not persisted. A producer that crashes is restarted by Broadway and scans
-  the snapshot again from the start, and so does a pipeline started again after a
-  failure. Make downstream writes idempotent, keyed for example by the snapshot id and
-  the row's own key, so a replay is harmless. This producer does not provide
-  exactly-once processing.
+  Without `:checkpoint`, progress is not persisted. A producer that crashes is restarted
+  by Broadway and scans the snapshot again from the start, and so does a pipeline started
+  again after a failure. Make downstream writes idempotent, keyed for example by the
+  snapshot id and the row's own key, so a replay is harmless. This producer does not
+  provide exactly-once processing. See "Checkpoints" below for scans that resume.
 
   When the pipeline shuts down mid-scan, the producer stops the worker. DBConnection
   then disconnects the connection it held, which cancels the query on the DuckDB
@@ -242,12 +271,12 @@ defmodule OffBroadway.Iceberg.Producer do
   sees no others reads every slice itself.
 
   A member that finishes a slice tells the others, and every member tells those that
-  join which slices are finished. Nothing is stored anywhere else: if every member stops
-  at once, for example in a full redeploy, the members that start next scan again. With
-  an integer or `{:as_of, datetime}` `:snapshot_id`, they read the same rows again, so
-  idempotent writes make that harmless, if wasteful. For a backfill, record the snapshot
-  and its outcome in your application, and only start the pipeline while the backfill is
-  not complete.
+  join which slices are finished. Without `:checkpoint`, nothing is stored anywhere else:
+  if every member stops at once, for example in a full redeploy, the members that start
+  next scan again. With an integer or `{:as_of, datetime}` `:snapshot_id`, they read the
+  same rows again, so idempotent writes make that harmless, if wasteful. With
+  `:checkpoint`, they only read the slices that no earlier run finished. See
+  "Checkpoints" below.
 
   ### What `:stop` means
 
@@ -283,12 +312,88 @@ defmodule OffBroadway.Iceberg.Producer do
   ### Requirements
 
   - All members must use the same pipeline name, `:table`, `:snapshot_id` and
-    `:distribute`. Producers that differ in any of them scan separately.
+    `:distribute`. Producers that differ in any of them scan separately. With
+    `:checkpoint`, the same `:job_id` takes the place of the pipeline name.
   - `:snapshot_id` must be an integer or `{:as_of, datetime}`. Members resolving
     `:current` at different times could read different snapshots.
 
   A member whose slice or plan fails emits `:exception`, leaves the group and stays
   idle. The other members read its slices.
+
+  ## Checkpoints
+
+  > #### Experimental {: .warning}
+  >
+  > Checkpoints are new. Their behavior may change.
+
+  With `:checkpoint`, a distributed scan records every slice it finishes in a backend,
+  such as Google Cloud Storage with `OffBroadway.Iceberg.Checkpoint.GCS`. A scan started
+  again, after a producer crashed, a node was replaced or every node restarted at once,
+  does not read the recorded slices again:
+
+      {OffBroadway.Iceberg.Producer,
+       connection: MyApp.QuackDB,
+       table: "lake.betting.events",
+       snapshot_id: 123456789,
+       distribute: true,
+       checkpoint: [
+         job_id: "events-backfill-2026-11",
+         backend:
+           {OffBroadway.Iceberg.Checkpoint.GCS,
+            bucket: "my-checkpoints", prefix: "iceberg", auth: {:goth, MyApp.Goth}}
+       ]}
+
+  `:checkpoint` requires `:distribute`, since what it records are slices. A single
+  producer on a single node is a distributed scan of one member.
+
+  ### Jobs
+
+  A job is one scan of one snapshot, named by `:job_id`. The first run of a job records
+  its snapshot and the fingerprint of its plan. Every later run checks that it planned
+  the same snapshot and slices before it reads a row, and fails its scan with an
+  `OffBroadway.Iceberg.Checkpoint.Error` if it did not, changing nothing. A different
+  `:slice_rows` makes a different plan, so keep it for the life of a job, and use a new
+  job id to scan again from the start.
+
+  `{:as_of, datetime}` resolves to the same snapshot on every run while the table's
+  snapshot log keeps it. A snapshot that was expired cannot be read again: the job then
+  fails, rather than reading another snapshot.
+
+  Producers with the same job id share its scan, as the producers of one pipeline do
+  without checkpoints.
+
+  ### What is recorded
+
+  A slice is recorded once it has been read to the end and every one of its batches was
+  acknowledged as successful. Only then do the other members hear that it is finished,
+  and only then does it count towards `:stop`. A run of the job loads the recorded slices
+  before it reads anything, and reads the others.
+
+  A slice with failed batches is not recorded. The run still counts it finished, as it
+  would without checkpoints, so `:stop` reports its failed batches, and it is not
+  retried. The next run of the job reads it again, with any other slice not recorded.
+  To retry the failed batches of a job, start it again once it has stopped. Members that
+  keep running, as in a rolling redeploy, remember the slice as finished, so only a run
+  that starts with no member running reads it again.
+
+  ### Failures
+
+  A producer that cannot load its job, or cannot record a slice it finished, fails its
+  scan with `:exception`, as a failed query does, and the other members read its slices.
+  A backend that cannot be reached is never taken for a job without finished slices, and
+  a slice whose write was not confirmed is never counted as recorded.
+
+  A producer that stops while it records a slice leaves the slice to be read again, as
+  do the slices that finish while the pipeline shuts down, if it stops before their
+  writes return.
+
+  ### Guarantees
+
+  Checkpoints spare a restarted scan the work that was finished. They do not make
+  processing exactly-once: a producer can process every batch of a slice and stop before
+  recording it, and members that read a slice at the same time each process it (see
+  "What `:stop` means"). Writes must be idempotent, as they must for any scan of this
+  producer.
 
   ## Telemetry
 
@@ -302,6 +407,17 @@ defmodule OffBroadway.Iceberg.Producer do
   - `[:off_broadway_iceberg, :scan, :exception]` - The scan failed. Measurements:
     `:duration`, `:batches`, `:rows`. Metadata: `:name`, `:table`, `:snapshot_id`
     (`nil` if the scan failed before resolving it), `:kind` and `:reason`.
+  - `[:off_broadway_iceberg, :checkpoint, :load]` - A checkpointed scan loaded its job.
+    Measurements: `:duration`, `:slices`, the number of slices in the plan, and
+    `:finished`, the number of them earlier runs finished. Metadata: `:name`, `:table`,
+    `:snapshot_id`, `:job_id`.
+  - `[:off_broadway_iceberg, :checkpoint, :write]` - A slice was recorded. Measurements:
+    `:duration`, `:batches`, `:rows`. Metadata: `:name`, `:table`, `:snapshot_id`,
+    `:job_id`, `:slice`.
+
+  The scan events of a checkpointed scan have its `:job_id` in their metadata too. A
+  scan that fails because a checkpoint could not be loaded or written has an
+  `OffBroadway.Iceberg.Checkpoint.Error` as its `:reason`.
 
   `:name` is the Broadway pipeline name, or `nil` outside Broadway. Durations are in
   `:native` time units. In a distributed scan, the counts of `:stop` cover every slice
@@ -352,6 +468,7 @@ defmodule OffBroadway.Iceberg.Producer do
   def init(opts) do
     name = opts |> Keyword.get(:broadway, []) |> Keyword.get(:name)
     {distribute, scan_opts} = opts |> validate_options!() |> Keyword.pop(:distribute)
+    {checkpoint, scan_opts} = Keyword.pop(scan_opts, :checkpoint)
 
     state = %{
       name: name,
@@ -382,11 +499,18 @@ defmodule OffBroadway.Iceberg.Producer do
       distributed?: distribute != nil,
       slices: if(distribute, do: nil, else: 1),
       units: nil,
+      plan: nil,
       planner: nil,
       group: nil,
       monitor: nil,
       members: [self()],
-      done: %{}
+      done: %{},
+      # With :checkpoint, the job and its backend. The scan reads no slice before the
+      # loader has returned the finished ones, and a slice it finishes is only announced
+      # once its write, one of :writes by reference, has stored it.
+      checkpoint: checkpoint && %{job_id: checkpoint[:job_id], backend: checkpoint[:backend], job: nil},
+      loader: nil,
+      writes: %{}
     }
 
     state = if distribute, do: plan(state, distribute), else: state
@@ -441,9 +565,9 @@ defmodule OffBroadway.Iceberg.Producer do
   end
 
   def handle_info({Scan, ref, {:plan, snapshot_id, units}}, %{planner: %{ref: ref}} = state) do
-    state = %{state | planner: nil, units: List.to_tuple(units), slices: length(units)}
+    state = %{state | planner: nil, units: List.to_tuple(units), plan: Distribution.fingerprint(units)}
 
-    {:noreply, [], state |> start_scan(snapshot_id) |> join() |> next_slice() |> maybe_complete()}
+    {:noreply, [], state |> start_scan(snapshot_id) |> load_checkpoints()}
   end
 
   def handle_info({Scan, ref, {:error, reason}}, %{planner: %{ref: ref}} = state) do
@@ -452,6 +576,37 @@ defmodule OffBroadway.Iceberg.Producer do
 
   # A worker that was stopped may have sent messages before it stopped.
   def handle_info({Scan, _ref, _event}, state), do: {:noreply, [], state}
+
+  def handle_info({Checkpoint, ref, {result, duration}}, %{loader: %{ref: ref}} = state) do
+    state = %{state | loader: nil}
+
+    with {:ok, finished} <- result,
+         {:ok, done} <- finished_slices(finished, tuple_size(state.units)) do
+      :telemetry.execute(
+        [:off_broadway_iceberg, :checkpoint, :load],
+        %{duration: duration, slices: tuple_size(state.units), finished: map_size(done)},
+        event_metadata(state)
+      )
+
+      Logger.debug(
+        "Loaded job #{inspect(state.checkpoint.job_id)}: #{map_size(done)} of #{tuple_size(state.units)} " <>
+          "slices finished"
+      )
+
+      {:noreply, [], start_slices(%{state | done: Distribution.merge(state.done, done)})}
+    else
+      error -> {:noreply, [], fail(state, describe(state, nil), error_reason(error))}
+    end
+  end
+
+  def handle_info({Checkpoint, ref, {result, duration}}, state) when is_map_key(state.writes, ref) do
+    {write, writes} = Map.pop!(state.writes, ref)
+
+    {:noreply, [], checkpointed(%{state | writes: writes}, write, result, duration)}
+  end
+
+  # A loader or write that was stopped may have sent its result before it stopped.
+  def handle_info({Checkpoint, _ref, _result}, state), do: {:noreply, [], state}
 
   def handle_info({:ack, ref, successful, failed}, state) when is_map_key(state.reads, ref) do
     read = Map.fetch!(state.reads, ref)
@@ -497,17 +652,20 @@ defmodule OffBroadway.Iceberg.Producer do
   # Broadway stops asking for messages and drains the ones it has, so stop fetching too.
   # A distributed producer also leaves its group, so the others take its slices over.
   @impl Broadway.Producer
+  # Checkpoint writes go on, so that slices whose last batches are acknowledged while
+  # draining are still recorded, if the pipeline waits for them.
   def prepare_for_draining(%{status: :running} = state) do
-    {:noreply, [], state |> stop_planner() |> stop_scan() |> leave() |> Map.put(:status, :cancelled)}
+    {:noreply, [], state |> stop_planner() |> stop_loader() |> stop_scan() |> leave() |> Map.put(:status, :cancelled)}
   end
 
   def prepare_for_draining(state), do: {:noreply, [], state}
 
   # A supervisor shutdown takes the worker down through the link. A normal stop does not
-  # propagate through a link, so stop the worker explicitly.
+  # propagate through a link, so stop the worker explicitly. A checkpoint write stopped
+  # midway leaves its slice to be read again, as one that was never written does.
   @impl GenStage
   def terminate(_reason, state) do
-    state |> stop_planner() |> stop_scan()
+    state |> stop_planner() |> stop_loader() |> stop_scan() |> stop_writes()
   end
 
   @doc false
@@ -546,11 +704,48 @@ defmodule OffBroadway.Iceberg.Producer do
        "got: #{inspect(snapshot_id)}"}
   end
 
+  @doc false
+  def validate_job_id(job_id)
+      when is_binary(job_id) and byte_size(job_id) in 1..@max_job_id_bytes and job_id not in [".", ".."] do
+    if String.valid?(job_id) and not String.match?(job_id, ~r/[\x00-\x1F\x7F]/),
+      do: {:ok, job_id},
+      else: validate_job_id(nil)
+  end
+
+  def validate_job_id(job_id) do
+    {:error,
+     "expected a job id of 1 to #{@max_job_id_bytes} bytes of UTF-8 without control characters, " <>
+       "other than \".\" and \"..\", got: #{inspect(job_id)}"}
+  end
+
+  @doc false
+  def validate_backend({module, opts}) when is_atom(module) and is_list(opts) do
+    if Code.ensure_loaded?(module) and function_exported?(module, :init, 1) and
+         function_exported?(module, :load, 2) and function_exported?(module, :complete, 4) do
+      case module.init(opts) do
+        {:ok, config} -> {:ok, {module, config}}
+        {:error, message} -> {:error, "invalid options for #{inspect(module)}: #{message}"}
+      end
+    else
+      {:error, "expected a module that implements #{inspect(Checkpoint)}, got: #{inspect(module)}"}
+    end
+  end
+
+  def validate_backend(_backend) do
+    {:error, "expected {module, options}, with a module that implements #{inspect(Checkpoint)}"}
+  end
+
   defp validate_options!(opts) do
     # Broadway injects :broadway (pipeline name and stage index) into the producer's options.
     {_broadway, opts} = Keyword.pop(opts, :broadway)
     opts = NimbleOptions.validate!(opts, @opts_schema)
     opts = Keyword.update!(opts, :distribute, &validate_distribute!/1)
+
+    if opts[:checkpoint] && !opts[:distribute] do
+      raise ArgumentError,
+            "#{inspect(__MODULE__)} requires :distribute with :checkpoint, since a checkpoint records " <>
+              "slices, which only a distributed scan has. A single producer is a distributed scan of one"
+    end
 
     if opts[:distribute] && opts[:snapshot_id] == :current do
       raise ArgumentError,
@@ -580,16 +775,91 @@ defmodule OffBroadway.Iceberg.Producer do
     %{state | planner: %{pid: Scan.plan(self(), ref, opts), ref: ref}}
   end
 
+  # A checkpointed scan reads no slice before it knows which ones a run of its job
+  # finished. Before the table's first snapshot, there is nothing to read or record.
+  defp load_checkpoints(%{checkpoint: %{backend: {backend, config}}, snapshot_id: snapshot_id} = state)
+       when snapshot_id != nil do
+    job = %{
+      id: state.checkpoint.job_id,
+      table: Scan.table_parts(state.table),
+      snapshot_id: snapshot_id,
+      plan: state.plan,
+      slices: tuple_size(state.units)
+    }
+
+    loader = run_checkpoint(fn -> backend.load(config, job) end)
+    %{state | loader: loader, checkpoint: %{state.checkpoint | job: job}}
+  end
+
+  defp load_checkpoints(state), do: start_slices(state)
+
+  defp start_slices(state) do
+    %{state | slices: tuple_size(state.units)} |> join() |> next_slice() |> maybe_complete()
+  end
+
+  # A backend may only return slices of the plan.
+  defp finished_slices(finished, slices) when is_map(finished) do
+    Enum.reduce_while(finished, {:ok, %{}}, fn
+      {slice, %{batches: batches, rows: rows}}, {:ok, done}
+      when is_integer(slice) and slice >= 0 and slice < slices and is_integer(batches) and batches >= 0 and
+             is_integer(rows) and rows >= 0 ->
+        {:cont, {:ok, Map.put(done, slice, {0, batches, rows})}}
+
+      {slice, result}, _done ->
+        message =
+          "the checkpoint backend loaded #{inspect(result)} for slice #{inspect(slice)}, " <>
+            "which is not a finished slice of a plan of #{slices} slices"
+
+        {:halt, {:error, %Checkpoint.Error{reason: :invalid, message: message}}}
+    end)
+  end
+
+  defp finished_slices(finished, _slices), do: {:error, unexpected_return({:ok, finished})}
+
+  defp error_reason({:error, reason}), do: reason
+  defp error_reason(other), do: unexpected_return(other)
+
+  defp unexpected_return(other) do
+    %Checkpoint.Error{reason: :invalid, message: "the checkpoint backend returned #{inspect(other, limit: 5)}"}
+  end
+
+  # Runs a backend call in a process linked to the producer, which then gets
+  # `{Checkpoint, ref, {result, duration}}`. A backend that raises or exits returns an
+  # error instead.
+  defp run_checkpoint(fun) do
+    producer = self()
+    ref = make_ref()
+
+    {:ok, pid} =
+      Task.start_link(fn ->
+        started = System.monotonic_time()
+
+        result =
+          try do
+            fun.()
+          rescue
+            exception -> {:error, exception}
+          catch
+            kind, reason -> {:error, {kind, reason}}
+          end
+
+        send(producer, {Checkpoint, ref, {result, System.monotonic_time() - started}})
+      end)
+
+    %{pid: pid, ref: ref}
+  end
+
   # Producers only share progress if they planned the same slices, because slices are
-  # known to each other by their position in the plan.
+  # known to each other by their position in the plan. Checkpointed producers share it
+  # with every producer of their job, as their checkpoints do.
   defp join(state) do
-    plan = state.units |> Tuple.to_list() |> Distribution.fingerprint()
-    group = {state.name, Scan.table_parts(state.table), state.snapshot_id, plan}
+    owner = if state.checkpoint, do: {:job, state.checkpoint.job_id}, else: state.name
+    group = {owner, Scan.table_parts(state.table), state.snapshot_id, state.plan}
     {monitor, members} = Distribution.join(group)
 
     Logger.debug(
       "Joined the scan of #{inspect(state.table)} at snapshot #{inspect(state.snapshot_id)} with plan " <>
-        "#{plan |> Base.encode16(case: :lower) |> binary_part(0, 12)}: #{state.slices} slices, " <>
+        "#{state.plan |> Base.encode16(case: :lower) |> binary_part(0, 12)}: #{state.slices} slices, " <>
         "#{length(members)} members"
     )
 
@@ -619,13 +889,13 @@ defmodule OffBroadway.Iceberg.Producer do
   end
 
   # Starts reading the first slice this producer owns that is neither finished nor read
-  # by it already, if it is not reading one.
+  # or being checkpointed by it already, if it is not reading one.
   defp next_slice(%{status: :running, scan: nil, slices: slices} = state) when is_integer(slices) do
-    read = MapSet.new(Map.values(state.reads), & &1.slice)
+    busy = MapSet.new(Map.values(state.reads) ++ Map.values(state.writes), & &1.slice)
 
     slice =
       Enum.find(0..(state.slices - 1)//1, fn slice ->
-        not is_map_key(state.done, slice) and not MapSet.member?(read, slice) and owner?(state, slice)
+        not is_map_key(state.done, slice) and not MapSet.member?(busy, slice) and owner?(state, slice)
       end)
 
     if slice, do: read_slice(state, slice), else: state
@@ -685,14 +955,73 @@ defmodule OffBroadway.Iceberg.Producer do
         %{state | reads: Map.delete(state.reads, ref)}
 
       %{exhausted?: true, emitted: emitted, acked: acked, failed: failed} = read when acked + failed == emitted ->
-        finished = %{read.slice => {read.failed, read.emitted, read.rows}}
-        if state.group, do: Distribution.announce(state.members, state.group, finished)
-
-        %{state | reads: Map.delete(state.reads, ref), done: Distribution.merge(state.done, finished)}
+        finish_read_slice(%{state | reads: Map.delete(state.reads, ref)}, read)
 
       _unfinished ->
         state
     end
+  end
+
+  # With checkpoints, a slice whose batches all succeeded is only announced once it is
+  # recorded, unless another member recorded it already. One with failed batches is not
+  # recorded, so that the next run of the job reads it again, but this run counts it
+  # finished, as it would without checkpoints.
+  defp finish_read_slice(%{checkpoint: nil} = state, read) do
+    finish_slice(state, read.slice, {read.failed, read.emitted, read.rows})
+  end
+
+  defp finish_read_slice(state, %{failed: 0} = read) do
+    if match?({0, _batches, _rows}, state.done[read.slice]),
+      do: finish_slice(state, read.slice, {0, read.emitted, read.rows}),
+      else: write_checkpoint(state, read)
+  end
+
+  defp finish_read_slice(state, read) do
+    Logger.warning(
+      "Not checkpointing #{describe(state, read.slice)}, since #{read.failed} of its batches failed. " <>
+        "The next run of job #{inspect(state.checkpoint.job_id)} reads it again"
+    )
+
+    finish_slice(state, read.slice, {read.failed, read.emitted, read.rows})
+  end
+
+  defp finish_slice(state, slice, counts) do
+    finished = %{slice => counts}
+    if state.group, do: Distribution.announce(state.members, state.group, finished)
+
+    %{state | done: Distribution.merge(state.done, finished)}
+  end
+
+  defp write_checkpoint(%{checkpoint: %{backend: {backend, config}, job: job}} = state, read) do
+    result = %{batches: read.emitted, rows: read.rows}
+    write = run_checkpoint(fn -> backend.complete(config, job, read.slice, result) end)
+
+    %{state | writes: Map.put(state.writes, write.ref, Map.merge(write, %{slice: read.slice, result: result}))}
+  end
+
+  defp checkpointed(state, %{slice: slice, result: result}, :ok, duration) do
+    :telemetry.execute(
+      [:off_broadway_iceberg, :checkpoint, :write],
+      %{duration: duration, batches: result.batches, rows: result.rows},
+      Map.put(event_metadata(state), :slice, slice)
+    )
+
+    state |> finish_slice(slice, {0, result.batches, result.rows}) |> next_slice() |> maybe_complete()
+  end
+
+  # A slice that cannot be recorded is not finished. The producer fails, and the members
+  # that own its slices now, this one included, read them again.
+  defp checkpointed(%{status: :running} = state, write, error, _duration) do
+    state |> stop_scan() |> fail(describe(state, write.slice), error_reason(error))
+  end
+
+  defp checkpointed(state, write, error, _duration) do
+    Logger.warning(
+      "Could not checkpoint #{describe(state, write.slice)}, which the next run of job " <>
+        "#{inspect(state.checkpoint.job_id)} reads again: #{format_reason(error_reason(error))}"
+    )
+
+    state
   end
 
   # Another member finished the slice this producer is reading, so stop reading it. Its
@@ -709,6 +1038,23 @@ defmodule OffBroadway.Iceberg.Producer do
   defp stop_planner(state) do
     Scan.cancel(state.planner.pid)
     %{state | planner: nil}
+  end
+
+  defp stop_loader(%{loader: nil} = state), do: state
+
+  defp stop_loader(state) do
+    stop_task(state.loader.pid)
+    %{state | loader: nil}
+  end
+
+  defp stop_writes(state) do
+    Enum.each(state.writes, fn {_ref, write} -> stop_task(write.pid) end)
+    %{state | writes: %{}}
+  end
+
+  defp stop_task(pid) do
+    Process.unlink(pid)
+    Process.exit(pid, :shutdown)
   end
 
   defp stop_scan(%{scan: nil} = state), do: state
@@ -744,17 +1090,21 @@ defmodule OffBroadway.Iceberg.Producer do
 
   defp maybe_complete(state), do: state
 
-  defp describe(%{units: nil} = state, _slice) do
+  defp describe(%{units: units} = state, slice) when units == nil or slice == nil do
     "#{inspect(state.table)} at snapshot #{inspect(state.snapshot_id)}"
   end
 
   defp describe(state, slice) do
-    "slice #{slice} of #{state.slices} (#{length(elem(state.units, slice))} data files) of " <>
+    "slice #{slice} of #{tuple_size(state.units)} (#{length(elem(state.units, slice))} data files) of " <>
       "#{inspect(state.table)} at snapshot #{inspect(state.snapshot_id)}"
   end
 
-  defp event_metadata(state) do
+  defp event_metadata(%{checkpoint: nil} = state) do
     %{name: state.name, table: state.table, snapshot_id: state.snapshot_id}
+  end
+
+  defp event_metadata(state) do
+    %{name: state.name, table: state.table, snapshot_id: state.snapshot_id, job_id: state.checkpoint.job_id}
   end
 
   defp duration(state), do: System.monotonic_time() - state.started_at
