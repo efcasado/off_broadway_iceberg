@@ -87,8 +87,9 @@ defmodule OffBroadway.Iceberg.Producer do
       doc: """
       A SQL condition the rows to read must meet, such as `"amount > 100"`, or
       `{condition, params}` with a `?` in the condition for each of `params`, such as
-      `{"ts >= ? AND ts < ?", [from, to]}`. Reads every row by default. See "Selecting
-      columns and rows" below.
+      `{"ts >= ? AND ts < ?", [from, to]}`. Reads every row by default. It must select the
+      same rows on every node and every run: pass fixed values as params rather than
+      calling `now()`. See "Selecting columns and rows" below.
       """
     ],
     distribute: [
@@ -204,9 +205,22 @@ defmodule OffBroadway.Iceberg.Producer do
   names one it cannot write. The condition itself is SQL, run as written: build it in your
   code, never from user input, and pass values as params.
 
-  The condition must select the same rows every time it runs, so it must not depend on
-  the time or on chance, as `now()`, `current_date` or `random()` do. A distributed scan
-  runs it once per slice, on several nodes, and a checkpointed job on every run.
+  > #### The condition must not change {: .warning}
+  >
+  > `:where` must select the same rows on every node, and on every run of a checkpointed
+  > job, for as long as the scan or job lasts. A distributed scan runs it once per slice,
+  > on several nodes, and the producer cannot check what it selects: the plan's
+  > fingerprint covers the condition's text, not its rows. With `"occurred_at < now()"`,
+  > members would read their slices up to different times, and a checkpointed job would
+  > resume with its recorded slices read up to an earlier time than the rest, so the rows
+  > in between are never read.
+  >
+  > Pass fixed values as params instead, such as `{"occurred_at < ?", [cutoff]}`, with a
+  > `cutoff` that is the same on every node and every run, for example from your
+  > configuration, next to the job id. A value computed as the pipeline starts, such as
+  > `DateTime.utc_now()`, differs between nodes and runs: those producers then scan
+  > apart, and a checkpointed job fails as incompatible when it runs again. Nothing that
+  > changes on its own, such as `current_date` or `random()`, belongs in the condition.
 
   In a distributed scan, the condition only filters the rows of each slice. Slices are
   still made of whole data files, sized by the rows of their files before the condition
@@ -411,6 +425,10 @@ defmodule OffBroadway.Iceberg.Producer do
   changing nothing. The plan covers the columns and rows the scan selects, so a different
   `:slice_rows`, `:columns` or `:where` makes a different plan. Keep them for the life of
   a job, and use a new job id to scan again from the start, or to select something else.
+
+  The plan covers the text of `:where`, not the rows it selects, so a job only resumes
+  correctly if its condition selects the same rows on every run. See "The condition
+  must not change" in "Selecting columns and rows" above.
 
   The table is recorded as its name parts, so `"lake.betting.events"` and
   `["lake", "betting", "events"]` name the same table, but `"events"` names another one,

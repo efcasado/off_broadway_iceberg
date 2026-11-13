@@ -399,17 +399,53 @@ defmodule OffBroadway.Iceberg.Integration.ProducerTest do
       assert messages |> ids() |> Enum.uniq() == expected_ids
       assert messages |> Enum.map(& &1.data.names) |> Enum.uniq() == [["payload", "id"]]
 
-      # Each insert made one data file, and each file is a slice, in path order. Slices
-      # whose file holds no selected rows emit nothing.
-      %{rows: files} =
-        QuackDB.query!(@pool, "SELECT file_path FROM iceberg_files(?) WHERE content = 0 ORDER BY file_path", [table])
-
-      slice_of_file = files |> List.flatten() |> Enum.with_index() |> Map.new()
-      %{rows: rows} = QuackDB.query!(@pool, "SELECT id, filename FROM #{table}")
-      slice_of_id = Map.new(rows, fn [id, path] -> {id, slice_of_file[path]} end)
+      # Slices whose file holds no selected rows emit nothing.
+      slice_of_id = slice_of_id(table)
 
       for message <- messages, id <- QuackDB.Columns.get(message.data, "id") do
         assert slice_of_id[id] == message.metadata.slice
+      end
+    end
+
+    test "no condition, not even one that closes its parenthesis, widens a slice", %{schema: schema} do
+      table = Iceberg.create_table!(@pool, schema)
+      for file <- 0..7, do: Iceberg.insert!(@pool, table, (file * 1_000)..(file * 1_000 + 999))
+      snapshot = @pool |> Iceberg.snapshots(table) |> List.last()
+      slice_of_id = slice_of_id(table)
+      # Rows of two files out of eight. The others hold none.
+      expected_ids = Enum.to_list(0..9) ++ Enum.to_list(5_000..5_004)
+
+      # Read after a slice's file filter, the second would select the rows of 5,000 to
+      # 5,004 in every slice.
+      for where <- ["id < ? OR id BETWEEN ? AND ?", "id < ?) OR (id BETWEEN ? AND ?"] do
+        name = unique_name()
+        Telemetry.attach_pipeline(name)
+
+        start_pipeline(
+          name,
+          [
+            table: table,
+            snapshot_id: snapshot,
+            columns: ["id"],
+            where: {where, [10, 5_000, 5_004]},
+            distribute: [slice_rows: 1_000]
+          ],
+          producer_concurrency: 2,
+          processor_concurrency: 4,
+          max_demand: 2
+        )
+
+        for _stage <- 1..2 do
+          assert_receive {:telemetry, [:off_broadway_iceberg, :scan, :stop], measurements, %{name: ^name}}, 60_000
+          assert measurements == Map.merge(measurements, %{rows: length(expected_ids), failed_batches: 0})
+        end
+
+        messages = drain_handled()
+        assert ids(messages) == expected_ids, "#{where} read each selected row once"
+
+        for message <- messages, id <- QuackDB.Columns.get(message.data, "id") do
+          assert slice_of_id[id] == message.metadata.slice
+        end
       end
     end
 
@@ -552,6 +588,16 @@ defmodule OffBroadway.Iceberg.Integration.ProducerTest do
   end
 
   defp ids(messages), do: messages |> Enum.flat_map(&QuackDB.Columns.get(&1.data, "id")) |> Enum.sort()
+
+  # The slice of each row of a table with slices of one data file each, in path order.
+  defp slice_of_id(table) do
+    %{rows: files} =
+      QuackDB.query!(@pool, "SELECT file_path FROM iceberg_files(?) WHERE content = 0 ORDER BY file_path", [table])
+
+    slice_of_file = files |> List.flatten() |> Enum.with_index() |> Map.new()
+    %{rows: rows} = QuackDB.query!(@pool, "SELECT id, filename FROM #{table}")
+    Map.new(rows, fn [id, path] -> {id, slice_of_file[path]} end)
+  end
 
   defp unique_name, do: :"pipeline_#{System.unique_integer([:positive])}"
 end

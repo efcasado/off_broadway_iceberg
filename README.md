@@ -148,10 +148,20 @@ parts of data files whose statistics rule the condition out. Delete files still 
 QuackDB writes the params into the condition as SQL literals. The condition itself is SQL,
 run as written: build it in your code, never from user input.
 
-The condition must select the same rows every time it runs, so it must not use `now()`,
-`current_date`, `random()` or anything else that changes. A distributed scan runs it once
-per slice, and a checkpointed job on every run. Producers that select different columns or
-rows never share a scan or a job.
+Producers that select different columns or rows never share a scan or a job.
+
+> #### The condition must not change {: .warning}
+>
+> `:where` must select the same rows on every node, and on every run of a checkpointed job.
+> The producer cannot check that: a job is recognized by the condition's text, not by the
+> rows it selects. With `"occurred_at < now()"`, a resumed job would skip the slices an
+> earlier run recorded up to an earlier time, and never read the rows in between.
+>
+> Pass fixed values as params instead, such as `{"occurred_at < ?", [cutoff]}`, with a
+> `cutoff` that stays the same for the whole backfill, for example from your configuration,
+> next to the job id. A value computed as the pipeline starts, such as `DateTime.utc_now()`,
+> differs between nodes and runs, so their producers scan apart, and a checkpointed job
+> fails as incompatible when it runs again.
 
 ### Distributed scans
 
