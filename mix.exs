@@ -19,7 +19,8 @@ defmodule OffBroadwayIceberg.MixProject do
       source_url: "https://github.com/efcasado/off_broadway_iceberg",
       docs: [
         main: "OffBroadway.Iceberg.Producer",
-        extras: ["README.md"]
+        extras: ["README.md", "guides/iceberg-and-duckdb.md"],
+        groups_for_extras: [Guides: ~r"guides/"]
       ]
     ]
   end
