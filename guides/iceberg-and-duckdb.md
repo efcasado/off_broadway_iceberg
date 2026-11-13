@@ -26,46 +26,44 @@ uses a real public catalog instead.
 ## The whole picture
 
 ```mermaid
-flowchart LR
-    subgraph Iceberg["ICEBERG · table metadata"]
-        direction TB
-        C["REST catalog<br/>lake.betting.events"]
-        M["Table metadata<br/>schema and references"]
-        S["Snapshot 1002"]
-        L["Manifests<br/>file inventory"]
-        C --> M --> S --> L
+flowchart TB
+    subgraph Meta["1 · ICEBERG DESCRIBES THE TABLE"]
+        direction LR
+        C["REST catalog<br/>table name → metadata"]
+        S["Snapshot 1002<br/>pinned table version"]
+        L["Manifests<br/>inventory of files"]
+        C --> S --> L
     end
 
-    subgraph Storage["OBJECT STORAGE"]
-        F[("Data + delete files")]
-    end
-
-    subgraph Pipeline["QUERY + PROCESSING"]
-        direction TB
+    subgraph Read["2 · DUCKDB READS THE DATA"]
+        direction LR
+        F[("Data + delete files<br/>object storage")]
         D["DuckDB<br/>Iceberg-aware SQL"]
         Q["QuackDB<br/>bounded batches"]
-        B["Broadway<br/>process and acknowledge"]
-        D --> Q --> B
+        F --> D --> Q
     end
 
-    G[("GCS checkpoints<br/>completed slices")]
+    subgraph Process["3 · BROADWAY PROCESSES IT"]
+        direction LR
+        B["Broadway<br/>process + acknowledge"]
+        G[("GCS checkpoints<br/>completed slices")]
+        B -.->|after successful processing| G
+    end
 
-    L -->|identifies| F
-    F -->|reads| D
-    S -.->|pins version| D
-    B -.->|successful slices| G
+    L -.->|identifies| F
+    Q -->|batches| B
 
-    classDef catalog fill:#eaf1ff,stroke:#5275bd,color:#203965,stroke-width:1.5px
+    classDef metadata fill:#eaf1ff,stroke:#5275bd,color:#203965,stroke-width:1.5px
     classDef files fill:#e7f5ed,stroke:#378263,color:#174b38,stroke-width:1.5px
     classDef compute fill:#f2edff,stroke:#8066bb,color:#42316c,stroke-width:1.5px
     classDef durable fill:#fff0db,stroke:#b98539,color:#68420d,stroke-width:1.5px
-    class C,M,S,L catalog
+    class C,S,L metadata
     class F files
     class D,Q,B compute
     class G durable
-    style Iceberg fill:#5275bd0c,stroke:#9aadd0,stroke-width:1px
-    style Storage fill:#3782630c,stroke:#92bca9,stroke-width:1px
-    style Pipeline fill:#8066bb0c,stroke:#b3a5d4,stroke-width:1px
+    style Meta fill:transparent,stroke:#9aadd0
+    style Read fill:transparent,stroke:#92bca9
+    style Process fill:transparent,stroke:#b3a5d4
 ```
 
 Read this as a map of responsibilities, **not a pipe through which every row travels**.
@@ -271,7 +269,7 @@ The library works with **two different units**:
 
 ```mermaid
 flowchart TB
-    subgraph Slices["Distributed slices · whole files"]
+    subgraph Work["FOUR INDEPENDENT SLICES"]
         direction LR
         S0["Slice 0<br/>F1 + F2"]
         S1["Slice 1<br/>F3 + F4"]
@@ -279,24 +277,23 @@ flowchart TB
         S3["Slice 3<br/>F7 + F8"]
     end
 
-    S0 --> D["DuckDB<br/>reads Slice 0"]
-    D --> B["Streaming row batches<br/>1, 2, …, N"]
-    B --> P["Broadway<br/>one message per batch"]
-    S1 -.->|independent work| D
-    S2 -.->|independent work| D
-    S3 -.->|independent work| D
+    S0 -->|one slice, expanded below| D["DuckDB reader<br/>files F1 + F2"]
+    D --> M["Row batches<br/>1, 2, …, N"]
+    M --> P["Broadway processors<br/>one message per batch"]
 
     classDef slice fill:#e7f5ed,stroke:#378263,color:#174b38,stroke-width:1.5px
     classDef stream fill:#eaf1ff,stroke:#5275bd,color:#203965,stroke-width:1.5px
     classDef process fill:#f2edff,stroke:#8066bb,color:#42316c,stroke-width:1.5px
     class S0,S1,S2,S3 slice
-    class D,B stream
+    class D,M stream
     class P process
-    style Slices fill:#3782630c,stroke:#92bca9
+    style Work fill:transparent,stroke:#92bca9
 ```
 
-A slice can contain millions of rows without holding them all in BEAM memory:
-the producer waits for Broadway demand before fetching another batch.
+The diagram expands **only Slice 0**. Slices 1–3 can be read independently by other
+producers using the same procedure. A slice can contain millions of rows without
+holding them all in BEAM memory: the producer waits for Broadway demand before
+fetching another batch.
 
 Planning reads only metadata. It asks the snapshot's manifests for its data files and
 their row counts, without opening any of them:
@@ -408,21 +405,19 @@ sequenceDiagram
     participant G as GCS
     participant O as Peers
 
-    rect rgb(235, 241, 255)
-        D->>P: Read rows in batches
-        P->>B: Emit batch messages
-        B-->>P: Acknowledge all batches
-        D-->>P: End of slice
+    D->>P: Read rows in batches
+    P->>B: Emit messages
+    B-->>P: Acknowledge all batches
+    D-->>P: End of slice
+    Note over P: All batches successfully acknowledged
+    P->>G: Create durable slice checkpoint
+    alt GCS confirms completion
+        G-->>P: Stored
+        P-->>O: Announce completed slice
+    else Crash or uncertain write
+        Note over P,G: No confirmed checkpoint in this run
+        Note over P: On restart, load GCS and replay if absent
     end
-
-    rect rgb(231, 245, 237)
-        Note over P: Fully processed slice
-        P->>G: Create checkpoint
-        G-->>P: Durable confirmation
-        P-->>O: Announce completion
-    end
-
-    Note over P,G: Crash before confirmation?<br/>The next run may replay this slice.
 ```
 
 If the producer crashes after processing rows but before GCS confirms the
