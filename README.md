@@ -343,12 +343,16 @@ reconnects it.
   Iceberg REST catalog end to end, with DuckDB managed by QuackDB and nothing else to set up.
 - [`examples/postgres_backfill.exs`](examples/postgres_backfill.exs) backfills the same data
   into PostgreSQL, with validation, a rejects table and idempotent, version-aware upserts.
+- [`examples/checkpointed_backfill.exs`](examples/checkpointed_backfill.exs) checkpoints a scan
+  in a GCS emulator, and resumes it after a crash.
 
 ```shell
 elixir examples/public_catalog.exs
 
 docker compose -f examples/docker-compose.yml up --detach --wait
 elixir examples/postgres_backfill.exs
+elixir examples/checkpointed_backfill.exs --crash-after 1
+elixir examples/checkpointed_backfill.exs
 ```
 
 See [`examples/README.md`](examples/README.md).

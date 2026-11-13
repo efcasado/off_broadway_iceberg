@@ -199,3 +199,70 @@ through the BEAM.
   with status 1. Running it again is safe, and writes what is missing.
 - If PostgreSQL cannot be reached at startup, for example because the Compose service is not
   running, the script exits with status 1 before reading anything.
+
+## Checkpointed backfill
+
+[`checkpointed_backfill.exs`](checkpointed_backfill.exs) reads `places.admin_areas` of the same
+public catalog, a table of three data files, with a checkpointed scan. Every data file makes a
+slice, and every finished slice is recorded in
+[fake-gcs-server](https://github.com/fsouza/fake-gcs-server), a GCS emulator, so a run that is
+stopped midway is resumed by the next one.
+
+It demonstrates:
+
+- A distributed scan of a single producer, which checkpoints need.
+- `OffBroadway.Iceberg.Checkpoint.GCS` pointed at an emulator, without authentication.
+- A job named after the snapshot it reads, which it pins.
+- The `[:off_broadway_iceberg, :checkpoint, ...]` telemetry events.
+
+### Running it
+
+[`docker-compose.yml`](docker-compose.yml) runs the emulator on port 4443, where the script
+looks for it, and the script creates the bucket. `--crash-after 1` halts the script once it has
+recorded one slice, as a crash would:
+
+```shell
+docker compose -f examples/docker-compose.yml up --detach --wait fake-gcs
+elixir examples/checkpointed_backfill.exs --crash-after 1
+elixir examples/checkpointed_backfill.exs
+elixir examples/checkpointed_backfill.exs
+docker compose -f examples/docker-compose.yml down --volumes
+```
+
+The first run reads the first slice, records it, and halts:
+
+```text
+Job admin-areas-7578015534121896607, snapshot 7578015534121896607
+0 of 3 slices finished by earlier runs
+
+Slice 0, batch 0: 1000 rows
+Slice 0, batch 1: 1000 rows
+Slice 0, batch 2: 48 rows
+Recorded slice 0: 3 batches, 2048 rows
+
+Halting, as a crash would. Run the script again to resume.
+```
+
+The second reads the other two, and the third finds every slice recorded and reads nothing:
+
+```text
+Job admin-areas-7578015534121896607, snapshot 7578015534121896607
+3 of 3 slices finished by earlier runs
+
+Completed.
+Slices recorded by this run: 0
+Rows of the snapshot: 5210
+Failed batches: 0
+```
+
+The checkpoints are objects of the emulator's `checkpoints` bucket:
+
+```shell
+curl -s "http://localhost:4443/storage/v1/b/checkpoints/o?prefix=examples/"
+```
+
+The emulator keeps them in memory, so stopping it starts every job over. When the catalog
+publishes a new snapshot of the table, the script starts a new job, named after it.
+
+To record checkpoints in a real bucket instead, drop `:endpoint` and authenticate with Goth:
+`auth: {:goth, MyApp.Goth}`. See `OffBroadway.Iceberg.Checkpoint.GCS`.
