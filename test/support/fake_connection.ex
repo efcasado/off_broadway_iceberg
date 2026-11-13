@@ -16,9 +16,9 @@ defmodule OffBroadway.Iceberg.Test.FakeConnection do
 
   - `:refs` - rows returned by the `iceberg_refs` query (default `[[42]]`)
   - `:history` - rows returned by the `iceberg_history` query (default `[[42]]`)
-  - `:rows` - rows of the scan, as one-element lists (default `[]`). A scan of slice `i`
-    of `n` gets the rows whose first value is `i` modulo `n`, standing in for DuckDB's
-    `hash/1`
+  - `:rows` - rows of the scan, as one-element lists (default `[]`)
+  - `:files` - data files of the snapshot, as `{path, rows}`, for distributed scans. The
+    `iceberg_files` query lists them, and a scan of some files gets their rows
   - `:fail` - `{:bind | :refs | :declare, exception}` or `{{:fetch, n}, exception}`
     makes that call fail; `{{:fetch, n}, {:disconnect, exception}}` also disconnects
   """
@@ -82,6 +82,10 @@ defmodule OffBroadway.Iceberg.Test.FakeConnection do
         String.contains?(query.statement, "iceberg_refs") ->
           respond(state, :refs, result(["snapshot_id"], Map.get(state.script, :refs, [[42]])))
 
+        String.contains?(query.statement, "iceberg_files") ->
+          files = for {path, rows} <- Map.get(state.script, :files, []), do: [path, length(rows)]
+          respond(state, :plan, result(["file_path", "record_count"], files))
+
         String.contains?(query.statement, "iceberg_history") ->
           respond(state, :history, result(["snapshot_id"], Map.get(state.script, :history, [[42]])))
 
@@ -102,7 +106,7 @@ defmodule OffBroadway.Iceberg.Test.FakeConnection do
 
     case respond(state, :declare, :ok) do
       {:ok, :ok, state} ->
-        rows = state.script |> Map.get(:rows, []) |> slice(params)
+        rows = rows(state.script, params)
         {:ok, query, cursor, put_in(state.cursors[cursor], %{rows: rows, fetched: 0})}
 
       error ->
@@ -131,8 +135,12 @@ defmodule OffBroadway.Iceberg.Test.FakeConnection do
     {:ok, result([], []), %{state | cursors: Map.delete(state.cursors, cursor)}}
   end
 
-  defp slice(rows, [_snapshot_id, count, index]), do: Enum.filter(rows, fn [id | _] -> rem(id, count) == index end)
-  defp slice(rows, [_snapshot_id]), do: rows
+  defp rows(script, [_snapshot_id]), do: Map.get(script, :rows, [])
+
+  defp rows(script, [_snapshot_id | paths]) do
+    files = Map.new(Map.get(script, :files, []))
+    Enum.flat_map(paths, &Map.fetch!(files, &1))
+  end
 
   defp respond(state, call, ok) do
     case Map.get(state.script, :fail) do

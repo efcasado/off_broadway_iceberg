@@ -8,12 +8,15 @@ defmodule OffBroadway.Iceberg.Scan do
   # blocking it. This process checks out one connection for the whole scan and reads the
   # stream, fetching a batch only once the producer has asked for one.
   #
-  # A scan reads either the whole snapshot or, with a `:slice` of `{key, count, index}`,
-  # the rows whose key hashes to `index` out of `count` slices.
+  # A scan reads either the whole snapshot or, with a `:slice` of `{:files, paths}`, the
+  # rows of those data files.
   #
   # Messages to the producer, in order: `{:snapshot, id | nil}`, any number of
   # `{:batch, %QuackDB.Columns{}}`, then `:done` or `{:error, reason}`. Each is sent as
   # `{OffBroadway.Iceberg.Scan, ref, event}`.
+  #
+  # `plan/3` starts a process of its own, which resolves the snapshot and divides its
+  # data files into slices, and sends `{:plan, snapshot_id, slices}` or `{:error, reason}`.
 
   alias QuackDB.Columns
 
@@ -26,6 +29,21 @@ defmodule OffBroadway.Iceberg.Scan do
   def start_link(producer, ref, opts) do
     {:ok, scan} = Task.start_link(fn -> run(producer, ref, opts) end)
     scan
+  end
+
+  @doc """
+  Plans a distributed scan for `producer`, linked to the caller: resolves the snapshot,
+  and divides its data files into slices of whole files, in path order, each with at
+  least `:slice_rows` rows but the last. Files are never split.
+  """
+  @spec plan(pid(), reference(), keyword()) :: pid()
+  def plan(producer, ref, opts) do
+    {:ok, planner} =
+      Task.start_link(fn ->
+        send(producer, {__MODULE__, ref, with_connection(opts, &plan_slices(&1, opts))})
+      end)
+
+    planner
   end
 
   @doc """
@@ -74,29 +92,61 @@ defmodule OffBroadway.Iceberg.Scan do
     parts |> Enum.map_intersperse(".", &QuackDB.Type.quote_identifier/1) |> IO.iodata_to_binary()
   end
 
-  @doc """
-  Whether `part` can be quoted as an identifier.
-  """
-  @spec name_part?(term()) :: boolean()
-  def name_part?(part) do
+  defp name_part?(part) do
     is_binary(part) and part != "" and String.valid?(part) and not String.contains?(part, <<0>>)
   end
 
   defp run(producer, ref, opts) do
-    result =
-      try do
-        DBConnection.run(
-          Keyword.fetch!(opts, :connection),
-          &scan(&1, producer, ref, opts),
-          timeout: :infinity
-        )
-      rescue
-        exception -> {:error, exception}
-      catch
-        :exit, reason -> {:error, reason}
-      end
+    send(producer, {__MODULE__, ref, with_connection(opts, &scan(&1, producer, ref, opts))})
+  end
 
-    send(producer, {__MODULE__, ref, result})
+  defp with_connection(opts, fun) do
+    DBConnection.run(Keyword.fetch!(opts, :connection), fun, timeout: :infinity)
+  rescue
+    exception -> {:error, exception}
+  catch
+    :exit, reason -> {:error, reason}
+  end
+
+  defp plan_slices(conn, opts) do
+    table = opts |> Keyword.fetch!(:table) |> table_parts() |> quote_name()
+
+    case resolve_snapshot(conn, table, Keyword.fetch!(opts, :snapshot_id)) do
+      nil ->
+        {:plan, nil, []}
+
+      snapshot_id ->
+        # The live data files of the snapshot, from its manifests. Reading them needs only
+        # the catalog, unlike the files' own metadata, which may need storage credentials
+        # that only the Iceberg scan has.
+        %{rows: files} =
+          QuackDB.query!(
+            conn,
+            "SELECT file_path, record_count FROM iceberg_files(?, snapshot_from_id => ?) " <>
+              "WHERE content = 0 ORDER BY file_path",
+            [table, snapshot_id]
+          )
+
+        {:plan, snapshot_id, slices(files, Keyword.fetch!(opts, :slice_rows))}
+    end
+  end
+
+  defp slices(files, slice_rows) do
+    Enum.chunk_while(
+      files,
+      {[], 0},
+      fn [path, rows], {paths, total} ->
+        paths = [path | paths]
+
+        if total + rows >= slice_rows,
+          do: {:cont, Enum.reverse(paths), {[], 0}},
+          else: {:cont, {paths, total + rows}}
+      end,
+      fn
+        {[], 0} -> {:cont, {[], 0}}
+        {paths, _total} -> {:cont, Enum.reverse(paths), {[], 0}}
+      end
+    )
   end
 
   defp scan(conn, producer, ref, opts) do
@@ -121,9 +171,9 @@ defmodule OffBroadway.Iceberg.Scan do
 
   defp slice_filter(nil), do: {[], []}
 
-  defp slice_filter({key, count, index}) do
-    columns = Enum.map_intersperse(key, ", ", &QuackDB.Type.quote_identifier/1)
-    {[" WHERE hash(", columns, ") % ? = ?"], [count, index]}
+  # DuckDB reads only the files named, and still applies their delete files.
+  defp slice_filter({:files, paths}) do
+    {[" WHERE filename IN (", Enum.map_intersperse(paths, ", ", fn _path -> "?" end), ")"], paths}
   end
 
   defp resolve_snapshot(_conn, _table, snapshot_id) when is_integer(snapshot_id), do: snapshot_id
