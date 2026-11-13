@@ -52,19 +52,34 @@ defmodule OffBroadway.Iceberg.Distribution do
   end
 
   @doc """
-  Identifies a plan by its slices: SHA-256 over the paths of their data files, slice by
-  slice, in order. Every slice, and every path in it, is length-prefixed, so that no two
-  plans encode alike.
+  Identifies a plan by its slices and by what it selects from them: SHA-256 over the paths
+  of the slices' data files, slice by slice, in order, then over the columns and the
+  condition, if there are any. Every slice, path, column and condition is
+  length-prefixed, so that no two plans encode alike. A plan that selects every column
+  and row keeps the fingerprint of its slices alone.
   """
-  @spec fingerprint([[String.t()]]) :: binary()
-  def fingerprint(slices) do
+  @spec fingerprint([[String.t()]], [String.t()] | nil, String.t() | nil) :: binary()
+  def fingerprint(slices, columns \\ nil, where \\ nil) do
     encoded =
       for paths <- slices do
-        [<<length(paths)::32>> | Enum.map(paths, &[<<byte_size(&1)::32>>, &1])]
+        [<<length(paths)::32>> | Enum.map(paths, &string/1)]
       end
 
-    :crypto.hash(:sha256, [<<length(slices)::32>> | encoded])
+    :crypto.hash(:sha256, [<<length(slices)::32>>, encoded, selection(columns, where)])
   end
+
+  # The slices encode to a prefix that ends where they end, so any selection that encodes
+  # to at least one byte is told apart from none.
+  defp selection(nil, nil), do: []
+
+  defp selection(columns, where) do
+    columns = if columns, do: [1, <<length(columns)::32>> | Enum.map(columns, &string/1)], else: [0]
+    where = if where, do: [1, string(where)], else: [0]
+
+    [columns, where]
+  end
+
+  defp string(string), do: [<<byte_size(string)::32>>, string]
 
   @doc """
   Sends finished slices to `members`, except the caller.

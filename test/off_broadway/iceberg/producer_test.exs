@@ -82,6 +82,49 @@ defmodule OffBroadway.Iceberg.ProducerTest do
       end
     end
 
+    test "accept columns and conditions in every supported form" do
+      for columns <- [["id"], ["id", "Amount", ~s(odd "name"), "t.x"]],
+          where <- [
+            "id > 1",
+            {"id > ?", [1]},
+            {"ts >= ? AND name = ? -- who?", [~U[2026-10-01 00:00:00Z], "o'brien"]},
+            {"id = ANY(?)", [[1, 2]]}
+          ] do
+        assert {[], _opts} = prepare(connection: MyApp.QuackDB, table: "events", columns: columns, where: where)
+      end
+    end
+
+    test "reject columns that do not name each column once" do
+      for columns <- [[], "id", ["id", ""], [:id], ["id", <<0>>], [1], ["id", "id"], ["id", "ID"]] do
+        assert_raise NimbleOptions.ValidationError, ~r/:columns/, fn ->
+          prepare(connection: MyApp.QuackDB, table: "events", columns: columns)
+        end
+      end
+    end
+
+    test "reject conditions that QuackDB cannot write with their params" do
+      for {where, message} <- [
+            {"", "not an empty one"},
+            {" \n", "not an empty one"},
+            {:id, "expected a SQL condition"},
+            {{"id > ?", 1}, "expected a SQL condition"},
+            {"id > ?", "for each of its 0 params"},
+            {{"a = ? AND b = ?", [1]}, "for each of its 1 params"},
+            {{"a = ?", [1, 2]}, "for each of its 2 params"},
+            {{"a = '?", [1]}, "every string and comment closed"},
+            {"a = 1 /* open", "every string and comment closed"},
+            {{"a = ?", [self()]}, "unsupported SQL parameter"}
+          ] do
+        error =
+          assert_raise NimbleOptions.ValidationError, fn ->
+            prepare(connection: MyApp.QuackDB, table: "events", where: where)
+          end
+
+        assert Exception.message(error) =~ "invalid value for :where option"
+        assert Exception.message(error) =~ message
+      end
+    end
+
     test "reject unknown options" do
       assert_raise NimbleOptions.ValidationError, ~r/unknown options \[:batch_size\]/, fn ->
         prepare(connection: MyApp.QuackDB, table: "events", batch_size: 10)
@@ -131,6 +174,42 @@ defmodule OffBroadway.Iceberg.ProducerTest do
       assert_receive {:fake, {:declare, statement, [7], 10_000}}
       assert statement == ~s(SELECT * FROM "lake"."odd ""name"""."t.x") <> @scan_statement_suffix
       refute_received {:fake, {:query, _statement, _params}}
+    end
+
+    test "select columns and rows from the snapshot, with the params written in" do
+      pool = start_pool(rows: rows(3))
+
+      %{consumer: consumer} =
+        start_producer(pool,
+          table: "events",
+          snapshot_id: 7,
+          columns: ["id", ~s(odd "name")],
+          where: {"id > ? AND name <> ? -- not 'x'", [1, "o'brien"]}
+        )
+
+      ManualConsumer.ask(consumer, 1)
+
+      assert_receive {:fake, {:declare, statement, [7], 10_000}}
+
+      assert statement ==
+               ~s|SELECT "id", "odd ""name""" FROM (SELECT * FROM "events" AT (VERSION => ?)) | <>
+                 ~s|WHERE (\nid > 1 AND name <> 'o''brien' -- not 'x'\n)|
+    end
+
+    test "select columns alone, or rows alone" do
+      for {opts, selection} <- [
+            {[columns: ["id"]], {~s("id"), ""}},
+            {[where: "id > 1"], {"*", " WHERE (\nid > 1\n)"}}
+          ] do
+        pool = start_pool([rows: rows(3)], id: make_ref())
+        %{consumer: consumer, table: table} = start_producer(pool, [id: make_ref(), snapshot_id: 7] ++ opts)
+
+        ManualConsumer.ask(consumer, 1)
+
+        {columns, condition} = selection
+        assert_receive {:fake, {:declare, statement, [7], 10_000}}
+        assert statement == ~s|SELECT #{columns} FROM (SELECT * FROM "#{table}" AT (VERSION => ?))#{condition}|
+      end
     end
   end
 

@@ -36,7 +36,7 @@ defmodule OffBroadway.Iceberg.Checkpoint do
   - `:table` - The table, as its name parts.
   - `:snapshot_id` - The snapshot the scan reads.
   - `:plan` - The SHA-256 of the scan's plan, which changes with its slices and their
-    data files.
+    data files, and with the columns and rows the scan selects.
   - `:slices` - The number of slices in the plan.
 
   Every field is immutable: a run of a job loads it only if every field is the same as

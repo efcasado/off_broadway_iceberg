@@ -55,6 +55,32 @@ defmodule OffBroadway.Iceberg.DistributionTest do
       assert Distribution.fingerprint([["a"], ["b"]]) == hd(fingerprints)
       assert byte_size(hd(fingerprints)) == 32
     end
+
+    test "cover the columns and rows a plan selects, and keep those of the slices alone without" do
+      slices = [["a"], ["b"]]
+
+      fingerprints =
+        for {columns, where} <- [
+              {nil, nil},
+              {["id"], nil},
+              {["ID"], nil},
+              {["id", "ts"], nil},
+              {["ts", "id"], nil},
+              {["id,ts"], nil},
+              {nil, "id > 1"},
+              {nil, "id > 10"},
+              {["id"], "id > 1"},
+              {[""], nil},
+              {nil, ""}
+            ],
+            do: Distribution.fingerprint(slices, columns, where)
+
+      assert Enum.uniq(fingerprints) == fingerprints
+
+      # Jobs recorded before plans could select anything keep their fingerprint.
+      assert hd(fingerprints) == Distribution.fingerprint(slices)
+      assert hd(fingerprints) == :crypto.hash(:sha256, <<2::32, 1::32, 1::32, "a", 1::32, 1::32, "b">>)
+    end
   end
 
   describe "options" do
@@ -149,6 +175,37 @@ defmodule OffBroadway.Iceberg.DistributionTest do
 
       assert_receive {:fake, {:declare, statement, [42, "file-00"], 5}}
       assert statement == ~s|SELECT * FROM "#{table}" AT (VERSION => ?) WHERE filename IN (?)|
+    end
+
+    test "selects columns and rows from each slice, after binding them once before listing files" do
+      pool = start_pool(files: Enum.take(@files, 1))
+      table = unique_table()
+
+      %{consumer: consumer} = start_member(pool, table, :a, columns: ["id"], where: {"id >= ?", [0]})
+      ManualConsumer.ask(consumer, 1)
+
+      assert_receive {:fake, {:declare, statement, [42, "file-00"], 5}}
+
+      assert statement ==
+               ~s|SELECT "id" FROM (SELECT * FROM "#{table}" AT (VERSION => ?) WHERE filename IN (?)) | <>
+                 ~s|WHERE (\nid >= 0\n)|
+
+      assert [{bind, [42]}, {"SELECT file_path, record_count FROM iceberg_files" <> _, _params}] =
+               for({:fake, {:query, statement, params}} <- flush(), do: {statement, params})
+
+      assert bind == ~s|SELECT "id" FROM (SELECT * FROM "#{table}" AT (VERSION => ?)) WHERE (\nid >= 0\n) LIMIT 0|
+    end
+
+    test "a selection DuckDB cannot bind fails the plan, before any data file is listed" do
+      error = %QuackDB.Error{message: ~s(Binder Error: Referenced column "amount" not found)}
+      pool = start_pool(files: @files, fail: {:bind, error})
+      table = unique_table()
+      Telemetry.attach_scan(table)
+
+      start_member(pool, table, :a, columns: ["amount"])
+
+      assert_receive {:telemetry, [:off_broadway_iceberg, :scan, :exception], _, %{reason: ^error, snapshot_id: nil}}
+      refute_received {:fake, {:query, "SELECT file_path" <> _rest, _params}}
     end
 
     test "a snapshot without data files completes at once" do
@@ -354,6 +411,34 @@ defmodule OffBroadway.Iceberg.DistributionTest do
 
       assert_receive {:telemetry, [:off_broadway_iceberg, :scan, :stop], %{rows: @rows, batches: @batches}, _}, 5_000
       assert received(:c) == []
+    end
+
+    test "is not shared by producers that select other columns or rows" do
+      pool = start_pool(files: @files, pool_size: 4)
+      table = unique_table()
+      Telemetry.attach_scan(table)
+
+      %{consumer: consumer} = start_member(pool, table, :a, columns: ["id"], where: "id >= 0")
+      ManualConsumer.ask(consumer, 1_000)
+      assert_receive {:telemetry, [:off_broadway_iceberg, :scan, :stop], %{rows: @rows}, _}, 5_000
+
+      # A producer of the same scan that joins after it ended reads nothing, while one
+      # that selects anything else reads every slice itself.
+      start_member(pool, table, :same, columns: ["id"], where: {"id >= ?", [0]})
+      assert_receive {:telemetry, [:off_broadway_iceberg, :scan, :stop], %{rows: @rows}, _}, 5_000
+      assert received(:same) == []
+
+      for {id, selection} <- [
+            other_rows: [columns: ["id"], where: "id >= 1"],
+            other_columns: [columns: ["id", "ts"], where: "id >= 0"],
+            everything: []
+          ] do
+        %{consumer: consumer} = start_member(pool, table, id, selection)
+        ManualConsumer.ask(consumer, 1_000)
+
+        assert length(received_all(id, @batches)) == @batches
+        assert_receive {:telemetry, [:off_broadway_iceberg, :scan, :stop], %{rows: @rows}, _}, 5_000
+      end
     end
 
     test "survives a producer that stops mid-scan, whose slices others read" do

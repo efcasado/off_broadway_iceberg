@@ -3,10 +3,10 @@ defmodule OffBroadway.Iceberg.Producer do
   A Broadway producer that reads one Apache Iceberg snapshot through DuckDB.
 
   The producer runs `SELECT * FROM table AT (VERSION => snapshot_id)` on a
-  [QuackDB](https://hexdocs.pm/quackdb) connection and emits the result as
-  `Broadway.Message`s, one message per fetched batch of rows. The snapshot is
-  fixed for the whole scan, so commits made to the table while the scan runs
-  are not read.
+  [QuackDB](https://hexdocs.pm/quackdb) connection, or reads only the columns and rows
+  that `:columns` and `:where` select, and emits the result as `Broadway.Message`s, one
+  message per fetched batch of rows. The snapshot is fixed for the whole scan, so commits
+  made to the table while the scan runs are not read.
 
   An Iceberg snapshot is finite: once every row has been emitted, the producer
   stops fetching and stays idle. It does not poll for new snapshots.
@@ -71,6 +71,24 @@ defmodule OffBroadway.Iceberg.Producer do
       doc: """
       The maximum number of rows in one message. See "Batches" below. This is not
       Broadway's batcher `:batch_size`, which counts messages.
+      """
+    ],
+    columns: [
+      type: {:custom, __MODULE__, :validate_columns, []},
+      doc: """
+      The columns to read, as a list of names such as `["id", "amount"]`, in the order the
+      messages hold them. Every name is quoted before it reaches SQL and names a top-level
+      column; a struct column is read whole. Reads every column by default. See
+      "Selecting columns and rows" below.
+      """
+    ],
+    where: [
+      type: {:custom, __MODULE__, :validate_where, []},
+      doc: """
+      A SQL condition the rows to read must meet, such as `"amount > 100"`, or
+      `{condition, params}` with a `?` in the condition for each of `params`, such as
+      `{"ts >= ? AND ts < ?", [from, to]}`. Reads every row by default. See "Selecting
+      columns and rows" below.
       """
     ],
     distribute: [
@@ -162,6 +180,41 @@ defmodule OffBroadway.Iceberg.Producer do
   The snapshot is resolved before the first fetch and every row is read with
   `AT (VERSION => snapshot_id)`, so the scan never sees later commits.
 
+  ## Selecting columns and rows
+
+  `:columns` and `:where` narrow what the scan reads:
+
+      columns: ["event_id", "occurred_at", "amount"],
+      where: {"occurred_at >= ? AND occurred_at < ?", [~U[2026-10-01 00:00:00Z], ~U[2026-11-01 00:00:00Z]]}
+
+  The scan then runs:
+
+      SELECT "event_id", "occurred_at", "amount"
+      FROM (SELECT * FROM table AT (VERSION => snapshot_id))
+      WHERE (
+      occurred_at >= TIMESTAMPTZ '2026-10-01T00:00:00Z' AND occurred_at < TIMESTAMPTZ '2026-11-01T00:00:00Z'
+      )
+
+  DuckDB pushes both into its Iceberg scan: it reads only the columns named, and can skip
+  the parts of data files whose statistics rule the condition out. The table's delete
+  files still apply. Each message holds the columns in the order `:columns` names them.
+
+  QuackDB writes the params into the condition as SQL literals, quoting strings, as it
+  does for any query. It takes the same values as `QuackDB.query/3`, and an option error
+  names one it cannot write. The condition itself is SQL, run as written: build it in your
+  code, never from user input, and pass values as params.
+
+  The condition must select the same rows every time it runs, so it must not depend on
+  the time or on chance, as `now()`, `current_date` or `random()` do. A distributed scan
+  runs it once per slice, on several nodes, and a checkpointed job on every run.
+
+  In a distributed scan, the condition only filters the rows of each slice. Slices are
+  still made of whole data files, sized by the rows of their files before the condition
+  applies, so with a selective condition a slice can hold far fewer rows than
+  `:slice_rows`, or none. The plan binds the columns and the condition once, without
+  reading any rows, so that a column that does not exist, or a condition DuckDB cannot
+  run, fails the scan before any slice is read.
+
   ## Batches
 
   Each message carries one `QuackDB.Columns` struct in `:data`: the rows of the batch
@@ -252,7 +305,8 @@ defmodule OffBroadway.Iceberg.Producer do
   small files make a slice once they hold `:slice_rows` rows between them, and a larger
   file makes a slice of its own. Files are never split. A slice is read with
   `SELECT * FROM table AT (VERSION => snapshot_id) WHERE filename IN (...)`, so DuckDB
-  opens only those files, and still applies the table's delete files.
+  opens only those files, and still applies the table's delete files. `:columns` and
+  `:where` then select from the rows of the slice, as above.
 
   Every data file is read by one slice, so the snapshot is read once in all. A scan
   cannot be shared by more members than it has slices, though: a table stored in a
@@ -261,10 +315,11 @@ defmodule OffBroadway.Iceberg.Producer do
   ### Members
 
   Once planned, a member joins a process group (OTP's `:pg`) named after the pipeline,
-  the table, the snapshot and the plan. Only members that planned the same slices share
-  a scan. A slice belongs to the member that wins rendezvous hashing over the group's
-  current members. When nodes join or leave, for example as an autoscaler adds or
-  removes pods, only the slices of the members that came or went move.
+  the table, the snapshot and the plan. Only members that planned the same slices, and
+  select the same columns and rows from them, share a scan. A slice belongs to the
+  member that wins rendezvous hashing over the group's current members. When nodes join
+  or leave, for example as an autoscaler adds or removes pods, only the slices of the
+  members that came or went move.
 
   The nodes must be connected to each other, as Phoenix's `DNSCluster` and `libcluster`
   connect them. A member only sees the members on nodes it is connected to, and one that
@@ -311,8 +366,8 @@ defmodule OffBroadway.Iceberg.Producer do
 
   ### Requirements
 
-  - All members must use the same pipeline name, `:table`, `:snapshot_id` and
-    `:distribute`. Producers that differ in any of them scan separately. With
+  - All members must use the same pipeline name, `:table`, `:snapshot_id`, `:columns`,
+    `:where` and `:distribute`. Producers that differ in any of them scan separately. With
     `:checkpoint`, the same `:job_id`, recorded in the same place, takes the place of
     the pipeline name. See "Checkpoints" below.
   - `:snapshot_id` must be an integer or `{:as_of, datetime}`. Members resolving
@@ -353,8 +408,9 @@ defmodule OffBroadway.Iceberg.Producer do
   it: its id, its table, its snapshot, the fingerprint of its plan and its number of
   slices. Every later run checks that all of them are the same before it reads a row,
   and fails its scan with an `OffBroadway.Iceberg.Checkpoint.Error` if any is not,
-  changing nothing. A different `:slice_rows` makes a different plan, so keep it for the
-  life of a job, and use a new job id to scan again from the start.
+  changing nothing. The plan covers the columns and rows the scan selects, so a different
+  `:slice_rows`, `:columns` or `:where` makes a different plan. Keep them for the life of
+  a job, and use a new job id to scan again from the start, or to select something else.
 
   The table is recorded as its name parts, so `"lake.betting.events"` and
   `["lake", "betting", "events"]` name the same table, but `"events"` names another one,
@@ -578,7 +634,8 @@ defmodule OffBroadway.Iceberg.Producer do
   end
 
   def handle_info({Scan, ref, {:plan, snapshot_id, units}}, %{planner: %{ref: ref}} = state) do
-    state = %{state | planner: nil, units: List.to_tuple(units), plan: Distribution.fingerprint(units)}
+    plan = Distribution.fingerprint(units, state.scan_opts[:columns], state.scan_opts[:where])
+    state = %{state | planner: nil, units: List.to_tuple(units), plan: plan}
 
     {:noreply, [], state |> start_scan(snapshot_id) |> load_checkpoints()}
   end
@@ -715,6 +772,55 @@ defmodule OffBroadway.Iceberg.Producer do
     {:error,
      "expected :current, {:as_of, datetime} or a snapshot id between 0 and #{@max_snapshot_id}, " <>
        "got: #{inspect(snapshot_id)}"}
+  end
+
+  @doc false
+  def validate_columns(columns) do
+    cond do
+      not (is_list(columns) and columns != [] and Enum.all?(columns, &Scan.name_part?/1)) ->
+        {:error, "expected a non-empty list of column names, each a non-empty string, got: #{inspect(columns)}"}
+
+      Enum.uniq_by(columns, &String.downcase/1) != columns ->
+        {:error, "expected every column once, as DuckDB matches names regardless of case, got: #{inspect(columns)}"}
+
+      true ->
+        {:ok, columns}
+    end
+  end
+
+  # QuackDB writes the params into the condition as SQL literals, as it does for any
+  # query, so the scan runs a condition without placeholders, and the plan's fingerprint
+  # covers exactly that condition. QuackDB only counts placeholders when there are params,
+  # so one more, after the condition, makes it count them always. It also tells a string
+  # or comment left open, which would hide that placeholder.
+  @doc false
+  def validate_where(condition) when is_binary(condition), do: format_where(condition, [], condition)
+
+  def validate_where({condition, params} = where) when is_binary(condition) and is_list(params),
+    do: format_where(condition, params, where)
+
+  def validate_where(where) do
+    {:error, "expected a SQL condition, or {condition, params} with a list of params, got: #{inspect(where)}"}
+  end
+
+  defp format_where(condition, params, where) do
+    with true <- String.valid?(condition) and String.trim(condition) != "",
+         {:ok, formatted} <- QuackDB.SQL.format([condition, "\n?"], params ++ [nil]) do
+      {:ok, String.replace_suffix(formatted, "\nNULL", "")}
+    else
+      false ->
+        {:error, "expected a SQL condition, not an empty one, got: #{inspect(where)}"}
+
+      {:error, %QuackDB.Error{code: :parameter_count_mismatch}} ->
+        {:error,
+         "expected a ? in the condition for each of its #{length(params)} params, outside strings and " <>
+           "comments, and every string and comment closed, got: #{inspect(where)}"}
+
+      {:error, error} ->
+        {:error, "#{Exception.message(error)}, in: #{inspect(where)}"}
+    end
+  rescue
+    exception -> {:error, "#{Exception.message(exception)}, in: #{inspect(where)}"}
   end
 
   @doc false

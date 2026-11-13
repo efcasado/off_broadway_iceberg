@@ -166,6 +166,35 @@ defmodule OffBroadway.Iceberg.CheckpointTest do
       end
     end
 
+    test "resumes its job only with the columns and rows the job's first run selected", ctx do
+      selection = [columns: ["id"], where: {"id >= ?", [10]}]
+      plan = Distribution.fingerprint(for({path, _rows} <- @files, do: [path]), ["id"], "id >= 10")
+
+      %{consumer: consumer} = start_member(ctx, :first, producer: selection)
+      assert_receive {:checkpoint, {:load, %{plan: ^plan} = job}}
+      ManualConsumer.ask(consumer, 1_000)
+      assert_receive {:telemetry, @stop, %{rows: @rows}, _metadata}, 5_000
+      flush()
+
+      # The same selection, with its params written in, resumes the job, which has
+      # nothing left to read.
+      start_member(ctx, :same, producer: [columns: ["id"], where: "id >= 10"])
+      assert_receive {:checkpoint, {:load, ^job}}
+      assert_receive {:telemetry, @stop, %{rows: @rows}, _metadata}, 5_000
+      refute_received {:fake, {:declare, _statement, _params, _max_rows}}
+
+      for {id, other} <- [
+            other_rows: [columns: ["id"], where: "id >= 11"],
+            other_columns: [columns: ["id", "ts"], where: "id >= 10"],
+            everything: []
+          ] do
+        start_member(ctx, id, producer: other)
+
+        assert_receive {:telemetry, @exception, _measurements, %{reason: %Error{reason: :incompatible}}}, 5_000
+        refute_receive {:fake, {:declare, _statement, _params, _max_rows}}, 100
+      end
+    end
+
     test "names its job's table by its parts, so both forms of a table's name resume it", ctx do
       Telemetry.attach([@stop, @exception], &(&1.table == [ctx.table]))
       Checkpoint.put_slices(ctx.store, ctx.job_id, Map.new(0..(@slices - 1), &{&1, @result}))
@@ -377,14 +406,18 @@ defmodule OffBroadway.Iceberg.CheckpointTest do
 
     assert_receive {:fake, {:connect}}
 
-    producer_opts = [
-      connection: pool,
-      table: ctx.table,
-      snapshot_id: Keyword.get(opts, :snapshot_id, 42),
-      fetch_size: 5,
-      distribute: [slice_rows: 10],
-      checkpoint: checkpoint(ctx.job_id, ctx.store, Keyword.get(opts, :backend, []))
-    ]
+    producer_opts =
+      Keyword.merge(
+        [
+          connection: pool,
+          table: ctx.table,
+          snapshot_id: Keyword.get(opts, :snapshot_id, 42),
+          fetch_size: 5,
+          distribute: [slice_rows: 10],
+          checkpoint: checkpoint(ctx.job_id, ctx.store, Keyword.get(opts, :backend, []))
+        ],
+        Keyword.get(opts, :producer, [])
+      )
 
     producer = start_supervised!(Supervisor.child_spec({Producer, producer_opts}, id: id, restart: :temporary))
 

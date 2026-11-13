@@ -301,7 +301,7 @@ defmodule OffBroadway.Iceberg.Checkpoint.GCS do
            message:
              "#{url(config, object)} records another job under this id, with #{Enum.join(differences, ", ")}. " <>
                "A job id names one table, snapshot and plan: use another job id, or the same table name, " <>
-               "snapshot and :slice_rows as the job's first run"
+               "snapshot, :slice_rows, :columns and :where as the job's first run"
          }}
     end
   end
