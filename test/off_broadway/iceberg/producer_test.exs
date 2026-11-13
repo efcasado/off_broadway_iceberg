@@ -89,7 +89,7 @@ defmodule OffBroadway.Iceberg.ProducerTest do
     end
 
     test "reject producer concurrency other than 1" do
-      assert_raise ArgumentError, ~r/requires producer concurrency 1, got: 2/, fn ->
+      assert_raise ArgumentError, ~r/requires producer concurrency 1 without :distribute, got: 2/, fn ->
         prepare([connection: MyApp.QuackDB, table: "events"], 2)
       end
     end
@@ -388,7 +388,7 @@ defmodule OffBroadway.Iceberg.ProducerTest do
 
       ManualConsumer.ask(consumer, 1)
       receive_messages(1)
-      scan = :sys.get_state(producer).state.scan
+      scan = :sys.get_state(producer).state.scan.pid
       ref = Process.monitor(scan)
 
       stop_supervised!(Producer)
@@ -406,7 +406,7 @@ defmodule OffBroadway.Iceberg.ProducerTest do
 
       ManualConsumer.ask(consumer, 1)
       receive_messages(1)
-      scan = :sys.get_state(producer).state.scan
+      scan = :sys.get_state(producer).state.scan.pid
       ref = Process.monitor(scan)
 
       GenStage.stop(producer)
@@ -434,7 +434,7 @@ defmodule OffBroadway.Iceberg.ProducerTest do
 
       assert_receive {:handling, processor}
       [producer] = Broadway.producer_names(name)
-      scan = :sys.get_state(producer).state.module_state.scan
+      scan = :sys.get_state(producer).state.module_state.scan.pid
       ref = Process.monitor(scan)
 
       stopping = Task.async(fn -> Broadway.stop(name) end)

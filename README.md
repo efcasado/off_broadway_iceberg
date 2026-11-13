@@ -100,8 +100,8 @@ end
 [Iceberg documentation](https://duckdb.org/docs/stable/extensions/iceberg/overview) for
 catalogs that need credentials and for object storage secrets.
 
-The producer requires `producer: [concurrency: 1]`, since every producer stage would scan
-the whole snapshot. Scale out with the processors instead.
+Without `:distribute` (see below), the producer requires `producer: [concurrency: 1]`, since
+every producer stage would scan the whole snapshot. Scale out with the processors instead.
 
 ### One DuckDB per pipeline
 
@@ -129,6 +129,42 @@ natural but are not reliable:
 - A `Task` started before the pipeline does not wait for the setup to finish, so the scan
   can start before the catalog is attached.
 
+### Distributed scans
+
+> #### Experimental {: .warning}
+>
+> Distributed scans are new. Their behavior may change.
+
+When the application runs on several connected nodes, for example a Phoenix application
+clustered with `DNSCluster` on Kubernetes, the producers of a pipeline can share one scan,
+and keep sharing it as an autoscaler adds and removes nodes:
+
+```elixir
+{OffBroadway.Iceberg.Producer,
+ connection: MyApp.QuackDB,
+ table: "lake.betting.events",
+ snapshot_id: {:as_of, ~U[2026-11-12 00:00:00Z]},
+ distribute: [key: "event_id", slices: 64]}
+```
+
+The snapshot is divided into slices by `hash(key)`. Every producer stage, on every node,
+joins a process group (OTP's `:pg`), reads the slices it owns, and tells the others which
+slices it finished. When a node joins or leaves, only the slices of that node move. Once
+every slice is finished, every producer emits `:stop`, with the counts of the whole scan.
+
+Nothing is stored outside the running nodes, which comes with trade-offs:
+
+- The nodes must be connected to each other. A node only sees the producers on nodes it
+  is connected to.
+- `:snapshot_id` must be an id or `{:as_of, datetime}`, the same on every node, so that
+  every producer reads the same snapshot.
+- A slice can be read twice while producers come and go, so writes must be idempotent.
+- If every node restarts at once, the scan starts over.
+- Each slice scans the whole snapshot in DuckDB. What slices divide is the transfer and
+  decoding of rows, and their processing.
+
+See "Distributed scans" in `OffBroadway.Iceberg.Producer` for the details.
+
 ### Options
 
 - `:connection` (required) - The QuackDB pool: the pid or registered name of a pool started
@@ -138,9 +174,12 @@ natural but are not reliable:
 - `:table` (required) - The table, as `"catalog.schema.table"` made of plain identifiers, or
   as a list of name parts such as `["lake", "betting", "my-events"]` for any other names.
   Every part is quoted before it reaches SQL.
-- `:snapshot_id` - `:current` (the default) or a snapshot id.
+- `:snapshot_id` - `:current` (the default), a snapshot id, or `{:as_of, datetime}` for the
+  snapshot that was current at that time.
 - `:fetch_size` - The maximum number of rows in one message (default `10_000`). It is not
   Broadway's batcher `:batch_size`, which counts messages.
+- `:distribute` - `[key: column, slices: 64]` shares the scan between the producers of the
+  pipeline on every connected node. See "Distributed scans" above.
 
 See `OffBroadway.Iceberg.Producer` for the full reference.
 

@@ -168,9 +168,15 @@ defmodule OffBroadway.Iceberg.Integration.ProducerTest do
 
       handler = fn message ->
         [producer] = Enum.map(Broadway.producer_names(name), &Process.whereis/1)
-        scan = :sys.get_state(producer).state.module_state.scan
         {:memory, producer_memory} = Process.info(producer, :memory)
-        {:memory, scan_memory} = Process.info(scan, :memory) || {:memory, 0}
+
+        # The worker is gone once the snapshot has been read to the end.
+        {:memory, scan_memory} =
+          case :sys.get_state(producer).state.module_state.scan do
+            %{pid: scan} -> Process.info(scan, :memory) || {:memory, 0}
+            nil -> {:memory, 0}
+          end
+
         send(test, {:memory, :erlang.memory(:total) - baseline, producer_memory, scan_memory})
         message
       end
@@ -268,7 +274,7 @@ defmodule OffBroadway.Iceberg.Integration.ProducerTest do
       assert_receive {:blocked, processor}, 30_000
 
       [producer] = Broadway.producer_names(name)
-      scan = :sys.get_state(producer).state.module_state.scan
+      scan = :sys.get_state(producer).state.module_state.scan.pid
       ref = Process.monitor(scan)
 
       stopping = Task.async(fn -> Broadway.stop(name) end)
@@ -279,6 +285,56 @@ defmodule OffBroadway.Iceberg.Integration.ProducerTest do
       # The pool has one connection, which the scan held.
       assert %{rows: [[42]]} = QuackDB.query!(single, "SELECT 42")
       refute_received {:telemetry, [:off_broadway_iceberg, :scan, :stop], _measurements, _metadata}
+    end
+  end
+
+  describe "distributed scans" do
+    test "producer stages share one scan, sliced by DuckDB's hash", %{schema: schema} do
+      table = Iceberg.create_table!(@pool, schema)
+      snapshot = Iceberg.insert!(@pool, table, 0..19_999)
+      name = unique_name()
+      Telemetry.attach_pipeline(name)
+
+      start_pipeline(name, [table: table, snapshot_id: snapshot, fetch_size: 500, distribute: [key: "id", slices: 16]],
+        producer_concurrency: 2,
+        processor_concurrency: 4,
+        max_demand: 2
+      )
+
+      # Every producer stage reports the whole scan.
+      for _stage <- 1..2 do
+        assert_receive {:telemetry, [:off_broadway_iceberg, :scan, :stop], measurements, %{name: ^name}}, 60_000
+        assert %{rows: 20_000, failed_batches: 0} = measurements
+      end
+
+      messages = drain_handled()
+      assert messages |> ids() |> Enum.uniq() == Enum.to_list(0..19_999)
+      assert messages |> Enum.map(& &1.metadata.slice) |> Enum.uniq() |> Enum.sort() == Enum.to_list(0..15)
+
+      # Each slice holds the rows DuckDB hashes to it.
+      %{rows: expected} = QuackDB.query!(@pool, "SELECT id, hash(id) % 16 FROM #{table}")
+      expected = Map.new(expected, fn [id, slice] -> {id, slice} end)
+
+      for message <- messages, id <- QuackDB.Columns.get(message.data, "id") do
+        assert expected[id] == message.metadata.slice
+      end
+    end
+
+    test "{:as_of, datetime} reads the snapshot that was current then", %{schema: schema} do
+      table = Iceberg.create_table!(@pool, schema)
+      first = Iceberg.insert!(@pool, table, 0..99)
+
+      %{rows: [[made_current_at]]} =
+        QuackDB.query!(@pool, "SELECT made_current_at FROM iceberg_history(?) WHERE snapshot_id = ?", [table, first])
+
+      as_of = DateTime.from_naive!(made_current_at, "Etc/UTC")
+      _second = Iceberg.insert!(@pool, table, 100..199)
+
+      {messages, _measurements, %{snapshot_id: ^first}} = scan(table: table, snapshot_id: {:as_of, as_of})
+      assert ids(messages) == Enum.to_list(0..99)
+
+      before_first = DateTime.shift(as_of, second: -1)
+      assert {[], %{rows: 0}, %{snapshot_id: nil}} = scan(table: table, snapshot_id: {:as_of, before_first})
     end
   end
 
@@ -326,7 +382,7 @@ defmodule OffBroadway.Iceberg.Integration.ProducerTest do
   defp start_pipeline(name, producer_opts, opts \\ []) do
     pipeline_opts =
       opts
-      |> Keyword.take([:handler, :processor_concurrency, :max_demand])
+      |> Keyword.take([:handler, :producer_concurrency, :processor_concurrency, :max_demand])
       |> Keyword.merge(name: name, test: self(), producer: Keyword.merge([connection: @pool], producer_opts))
 
     start_supervised!({Pipeline, pipeline_opts}, id: name, restart: :temporary)
@@ -345,6 +401,15 @@ defmodule OffBroadway.Iceberg.Integration.ProducerTest do
 
       send(test, {:handled, message, self()})
       message
+    end
+  end
+
+  # Every handled message received so far, once nothing more arrives for a moment.
+  defp drain_handled(messages \\ []) do
+    receive do
+      {:handled, message, _processor} -> drain_handled([message | messages])
+    after
+      200 -> Enum.reverse(messages)
     end
   end
 
