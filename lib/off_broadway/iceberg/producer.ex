@@ -212,44 +212,73 @@ defmodule OffBroadway.Iceberg.Producer do
   >
   > Distributed scans are new. Their behavior may change.
 
-  With `:distribute`, the snapshot is divided into slices by hashing the key columns:
-  slice `i` of `n` holds the rows where `hash(key) % n = i`. Every producer stage of the
-  pipeline, on every connected node, joins a process group (OTP's `:pg`) for the scan
-  and reads the slices it owns, so `producer: [concurrency: 2]` on three nodes makes six
-  members. A slice belongs to the member that wins rendezvous hashing over the group's
+  With `:distribute`, the producers of this pipeline on every connected node share one
+  scan. Every producer stage is a member, so `producer: [concurrency: 2]` on three nodes
+  makes six.
+
+  ### Slices
+
+  Each member plans the scan the same way. It resolves the snapshot and lists its data
+  files from the table's manifests, through `iceberg_files`, in path order. Consecutive
+  small files make a slice once they hold `:slice_rows` rows between them, and a larger
+  file makes a slice of its own. Files are never split. A slice is read with
+  `SELECT * FROM table AT (VERSION => snapshot_id) WHERE filename IN (...)`, so DuckDB
+  opens only those files, and still applies the table's delete files.
+
+  Every data file is read by one slice, so the snapshot is read once in all. A scan
+  cannot be shared by more members than it has slices, though: a table stored in a
+  single large file is read by a single member.
+
+  ### Members
+
+  Once planned, a member joins a process group (OTP's `:pg`) named after the pipeline,
+  the table, the snapshot and the plan. Only members that planned the same slices share
+  a scan. A slice belongs to the member that wins rendezvous hashing over the group's
   current members. When nodes join or leave, for example as an autoscaler adds or
-  removes pods, the slices of the members that came or went move to others, and the
-  rest stay where they are.
+  removes pods, only the slices of the members that came or went move.
 
   The nodes must be connected to each other, as Phoenix's `DNSCluster` and `libcluster`
-  connect them. A node only sees the members on the nodes it is connected to, and a
-  member that sees no others reads every slice itself.
+  connect them. A member only sees the members on nodes it is connected to, and one that
+  sees no others reads every slice itself.
 
-  A member that finishes a slice, with every batch acknowledged, tells the others, and
-  members tell every member that joins what they know. When every slice is finished,
-  every member emits `:stop`, with the counts of the whole scan. A member that joins
-  after that emits `:stop` without reading anything.
+  A member that finishes a slice tells the others, and every member tells those that
+  join which slices are finished. Nothing is stored anywhere else: if every member stops
+  at once, for example in a full redeploy, the members that start next scan again.
 
-  The members agree on the scan without any shared storage, which comes with trade-offs:
+  ### What `:stop` means
 
-  - All producers must use the same `:table`, `:snapshot_id` and `:distribute`, and the
-    same pipeline name. Those make up the group, so producers that differ in any of
-    them scan separately.
-  - `:snapshot_id` must be an integer or `{:as_of, datetime}`. Producers resolving
+  A slice is finished once a member has read it to the end and every one of its
+  batches has been acknowledged. Members only ever tell each other about finished
+  slices. That news can arrive late, or not at all, but it never names a slice that was
+  not processed.
+
+  A member emits `:stop` once it knows that every slice is finished and every batch it
+  emitted itself has been acknowledged. So `:stop` means that every row of the snapshot
+  was processed at least once, by this member or by one it heard from. Its counts cover
+  each slice once. A member that joins after the scan finished emits `:stop` without
+  reading anything.
+
+  `:stop` does not mean that each row was processed exactly once, or that other members
+  are done. A slice can be processed more than once:
+
+  - A member keeps reading a slice it stopped owning, until another member finishes it.
+  - A member that fails or stops leaves the group, and the slices it had not finished
+    are read again, from the start, by the members that own them now.
+  - Members that cannot reach each other, for example on either side of a network
+    partition, each scan on their own. Each side can emit `:stop`, and what `:stop`
+    means still holds on each side, but both sides may process the same slices.
+
+  Writes must be idempotent, as they must for any scan of this producer.
+
+  ### Requirements
+
+  - All members must use the same pipeline name, `:table`, `:snapshot_id` and
+    `:distribute`. Producers that differ in any of them scan separately.
+  - `:snapshot_id` must be an integer or `{:as_of, datetime}`. Members resolving
     `:current` at different times could read different snapshots.
-  - Every slice scans the whole snapshot in DuckDB, which filters the rows of the other
-    slices. What the slices divide is the transfer and decoding of rows, and their
-    processing.
-  - A slice can be read more than once. A member keeps reading a slice it no longer
-    owns, and stops when another member finishes it first. A member that fails, or
-    stops, leaves the group, and the slices it had not finished are read by others from
-    the start. Writes must be idempotent.
-  - Progress lives in the members. If every member stops at once, for example in a
-    full redeploy, the next members scan the snapshot again.
-  - Every node must run the same DuckDB version, because `hash/1` must agree everywhere.
 
-  A failed slice fails only the member that read it: it emits `:exception`, leaves the
-  group, and stays idle. The slice is read again by another member.
+  A member whose slice or plan fails emits `:exception`, leaves the group and stays
+  idle. The other members read its slices.
 
   ## Telemetry
 
@@ -265,8 +294,9 @@ defmodule OffBroadway.Iceberg.Producer do
     (`nil` if the scan failed before resolving it), `:kind` and `:reason`.
 
   `:name` is the Broadway pipeline name, or `nil` outside Broadway. Durations are in
-  `:native` time units. In a distributed scan, the counts of `:stop` cover every slice,
-  wherever it was read, and those of `:exception` the batches this producer emitted.
+  `:native` time units. In a distributed scan, the counts of `:stop` cover every slice
+  once, wherever it was read, and those of `:exception` the batches this producer
+  emitted. See "What `:stop` means" above.
 
   A `:stop` event with `failed_batches: 0` means every emitted batch was processed
   successfully. With `failed_batches` above 0, the scan read the whole snapshot, but that
