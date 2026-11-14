@@ -35,7 +35,23 @@ defmodule PublicCatalog.Backfill do
       producer: [
         module:
           {OffBroadway.Iceberg.Producer,
-           connection: connection,
+           managed: [
+             server: [
+               # Proposed upstream QuackDB option; unavailable in 0.7.x.
+               init_sql: """
+               INSTALL iceberg;
+               LOAD iceberg;
+               INSTALL httpfs;
+               LOAD httpfs;
+               ATTACH 'commons/pubdata' AS pubdata (
+                 TYPE iceberg,
+                 URI 'https://public-catalog.lakehousebox.com',
+                 AUTHORIZATION_TYPE 'none'
+               );
+               """
+             ],
+             client: [pool_size: 2]
+           ]
            table: "pubdata." <> Keyword.fetch!(opts, :table),
            snapshot_id: Keyword.fetch!(opts, :snapshot_id),
            fetch_size: 5_000},
@@ -91,28 +107,9 @@ defmodule PublicCatalog do
     IO.puts("Starting DuckDB (the first run downloads it)...")
 
     children =
-      QuackDB.Server.child_specs(
-        server: [
-            name: PublicCatalog.DuckDB,
-            duckdb: :managed,
-            # Proposed upstream QuackDB :init_sql; not yet supported in ~> 0.7.0.
-            init_sql: """
-            INSTALL iceberg;
-            LOAD iceberg;
-            INSTALL httpfs;
-            LOAD httpfs;
-            ATTACH 'commons/pubdata' AS pubdata (
-              TYPE iceberg,
-              URI 'https://public-catalog.lakehousebox.com',
-              AUTHORIZATION_TYPE 'none'
-            );
-            """
-          ],
-        client: [name: PublicCatalog.QuackDB, pool_size: 2]
-      ) ++
-        [
+      [
           {PublicCatalog.Backfill,
-           connection: PublicCatalog.QuackDB, table: table, snapshot_id: {:as_of, DateTime.utc_now()}}
+           table: table, snapshot_id: {:as_of, DateTime.utc_now()}}
         ]
 
     case Supervisor.start_link(children, strategy: :rest_for_one) do
