@@ -127,10 +127,8 @@ defmodule PostgresBackfill.Pipeline do
   alias Broadway.Message
 
   def start_link(opts) do
-    duckdb = Keyword.fetch!(opts, :duckdb)
     postgres = Keyword.fetch!(opts, :postgres)
 
-    # The DuckDB server has already loaded Iceberg and attached the catalog.
     Earthquakes.create_tables!(postgres)
     IO.puts("PostgreSQL tables ready.\n")
 
@@ -139,7 +137,23 @@ defmodule PostgresBackfill.Pipeline do
       producer: [
         module:
           {OffBroadway.Iceberg.Producer,
-           connection: duckdb,
+           managed: [
+             server: [
+               # Proposed upstream QuackDB option; unavailable in 0.7.x.
+               init_sql: """
+               INSTALL iceberg;
+               LOAD iceberg;
+               INSTALL httpfs;
+               LOAD httpfs;
+               ATTACH 'commons/pubdata' AS pubdata (
+                 TYPE iceberg,
+                 URI 'https://public-catalog.lakehousebox.com',
+                 AUTHORIZATION_TYPE 'none'
+               );
+               """
+             ],
+             client: [pool_size: 2]
+           ]
            table: "pubdata.environment.earthquakes",
            snapshot_id: Keyword.fetch!(opts, :snapshot_id),
            fetch_size: 5_000},
@@ -192,33 +206,13 @@ defmodule PostgresBackfill do
     IO.puts("Starting DuckDB (the first run downloads it)...")
 
     children =
-      QuackDB.Server.child_specs(
-        server: [
-            name: PostgresBackfill.DuckDB,
-            duckdb: :managed,
-            # Proposed upstream QuackDB :init_sql; not yet supported in ~> 0.7.0.
-            init_sql: """
-            INSTALL iceberg;
-            LOAD iceberg;
-            INSTALL httpfs;
-            LOAD httpfs;
-            ATTACH 'commons/pubdata' AS pubdata (
-              TYPE iceberg,
-              URI 'https://public-catalog.lakehousebox.com',
-              AUTHORIZATION_TYPE 'none'
-            );
-            """
-          ],
-        client: [name: PostgresBackfill.QuackDB, pool_size: 2]
-      ) ++
-        [
+      [
           # Both pools are DBConnection pools, whose child ids would clash.
           Supervisor.child_spec(
             {Postgrex, postgres_options(database_url) ++ [name: PostgresBackfill.Postgres, pool_size: 4]},
             id: PostgresBackfill.Postgres
           ),
           {PostgresBackfill.Pipeline,
-           duckdb: PostgresBackfill.QuackDB,
            postgres: PostgresBackfill.Postgres,
            snapshot_id: {:as_of, DateTime.utc_now()}}
         ]
