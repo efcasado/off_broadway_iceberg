@@ -30,23 +30,6 @@ defmodule PublicCatalog.Backfill do
   def start_link(opts) do
     connection = Keyword.fetch!(opts, :connection)
 
-    # Extensions and attached catalogs belong to the DuckDB server, so they are set up
-    # again whenever a restarted server restarts the pipeline.
-    IO.puts("Connecting to the public Iceberg catalog...")
-
-    for extension <- ["iceberg", "httpfs"] do
-      QuackDB.query!(connection, "INSTALL #{extension}")
-      QuackDB.query!(connection, "LOAD #{extension}")
-    end
-
-    QuackDB.query!(
-      connection,
-      "ATTACH IF NOT EXISTS 'commons/pubdata' AS pubdata " <>
-        "(TYPE iceberg, URI 'https://public-catalog.lakehousebox.com', AUTHORIZATION_TYPE 'none')"
-    )
-
-    IO.puts("Catalog attached.\n")
-
     Broadway.start_link(__MODULE__,
       name: __MODULE__,
       producer: [
@@ -109,7 +92,22 @@ defmodule PublicCatalog do
 
     children =
       QuackDB.Server.child_specs(
-        server: [name: PublicCatalog.DuckDB, duckdb: :managed],
+        server: [
+            name: PublicCatalog.DuckDB,
+            duckdb: :managed,
+            # Proposed upstream QuackDB :init_sql; not yet supported in ~> 0.7.0.
+            init_sql: """
+            INSTALL iceberg;
+            LOAD iceberg;
+            INSTALL httpfs;
+            LOAD httpfs;
+            ATTACH 'commons/pubdata' AS pubdata (
+              TYPE iceberg,
+              URI 'https://public-catalog.lakehousebox.com',
+              AUTHORIZATION_TYPE 'none'
+            );
+            """
+          ],
         client: [name: PublicCatalog.QuackDB, pool_size: 2]
       ) ++
         [
