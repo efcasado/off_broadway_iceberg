@@ -122,6 +122,55 @@ defmodule OffBroadway.Iceberg.DistributionTest do
       end
     end
 
+    test "managed mode starts exactly one server and pool before any producer stage" do
+      opts = [
+        managed: [server: [init_sql: "INSTALL iceberg; LOAD iceberg;"], client: [pool_size: 4]],
+        table: "events",
+        snapshot_id: 7
+      ]
+
+      {children, broadway} = prepare(opts, 4)
+      assert length(children) == 2
+      assert [%{start: {QuackDB.Server, :start_link, [server_opts]}}, _pool] = children
+      assert server_opts[:duckdb] == :managed
+      assert server_opts[:init_sql] == "INSTALL iceberg; LOAD iceberg;"
+
+      {Producer, scan_opts} = broadway[:producer][:module]
+      assert scan_opts[:connection] == Module.concat(__MODULE__, QuackDB)
+      refute Keyword.has_key?(scan_opts, :managed)
+      assert broadway[:producer][:concurrency] == 4
+      assert Options.validate!(scan_opts)[:connection] == Module.concat(__MODULE__, QuackDB)
+    end
+
+    test "managed mode respects explicit names and server settings" do
+      opts = [
+        managed: [
+          server: [name: MyApp.DuckDB, settings: [threads: 2]],
+          client: [name: MyApp.QuackDB, pool_size: 3]
+        ],
+        table: "events",
+        snapshot_id: 7
+      ]
+
+      {[server, _pool], broadway} = prepare(opts)
+      assert server.id == MyApp.DuckDB
+      {Producer, scan_opts} = broadway[:producer][:module]
+      assert scan_opts[:connection] == MyApp.QuackDB
+      assert scan_opts[:snapshot_id] == 7
+    end
+
+    test "requires exactly one of an external pool or managed DuckDB" do
+      assert_raise ArgumentError, ~r/exactly one/, fn ->
+        prepare(table: "events", snapshot_id: 7)
+      end
+
+      assert_raise ArgumentError, ~r/exactly one/, fn ->
+        prepare(connection: MyApp.QuackDB, managed: [server: []], table: "events", snapshot_id: 7)
+      end
+
+      assert {[], _} = prepare(connection: MyApp.QuackDB, table: "events", snapshot_id: 7)
+    end
+
     test "allows more than one producer stage" do
       assert {[], _opts} = prepare([connection: MyApp.QuackDB, table: "events", snapshot_id: 7], 4)
     end
@@ -573,7 +622,7 @@ defmodule OffBroadway.Iceberg.DistributionTest do
   end
 
   defp prepare(producer_opts, concurrency \\ 1) do
-    Producer.prepare_for_start(__MODULE__, producer: [module: {Producer, producer_opts}, concurrency: concurrency])
+    Producer.prepare_for_start(__MODULE__, name: __MODULE__, producer: [module: {Producer, producer_opts}, concurrency: concurrency])
   end
 
   defp start_pool(script, opts \\ []) do

@@ -28,31 +28,28 @@ defmodule PublicCatalog.Backfill do
   alias Broadway.Message
 
   def start_link(opts) do
-    connection = Keyword.fetch!(opts, :connection)
-
-    # Extensions and attached catalogs belong to the DuckDB server, so they are set up
-    # again whenever a restarted server restarts the pipeline.
-    IO.puts("Connecting to the public Iceberg catalog...")
-
-    for extension <- ["iceberg", "httpfs"] do
-      QuackDB.query!(connection, "INSTALL #{extension}")
-      QuackDB.query!(connection, "LOAD #{extension}")
-    end
-
-    QuackDB.query!(
-      connection,
-      "ATTACH IF NOT EXISTS 'commons/pubdata' AS pubdata " <>
-        "(TYPE iceberg, URI 'https://public-catalog.lakehousebox.com', AUTHORIZATION_TYPE 'none')"
-    )
-
-    IO.puts("Catalog attached.\n")
-
     Broadway.start_link(__MODULE__,
       name: __MODULE__,
       producer: [
         module:
           {OffBroadway.Iceberg.Producer,
-           connection: connection,
+           managed: [
+             server: [
+               # Proposed upstream QuackDB option; unavailable in 0.7.x.
+               init_sql: """
+               INSTALL iceberg;
+               LOAD iceberg;
+               INSTALL httpfs;
+               LOAD httpfs;
+               ATTACH 'commons/pubdata' AS pubdata (
+                 TYPE iceberg,
+                 URI 'https://public-catalog.lakehousebox.com',
+                 AUTHORIZATION_TYPE 'none'
+               );
+               """
+             ],
+             client: [pool_size: 2]
+           ],
            table: "pubdata." <> Keyword.fetch!(opts, :table),
            snapshot_id: Keyword.fetch!(opts, :snapshot_id),
            fetch_size: 5_000},
@@ -108,19 +105,15 @@ defmodule PublicCatalog do
     IO.puts("Starting DuckDB (the first run downloads it)...")
 
     children =
-      QuackDB.Server.child_specs(
-        server: [name: PublicCatalog.DuckDB, duckdb: :managed],
-        client: [name: PublicCatalog.QuackDB, pool_size: 2]
-      ) ++
-        [
+      [
           {PublicCatalog.Backfill,
-           connection: PublicCatalog.QuackDB, table: table, snapshot_id: {:as_of, DateTime.utc_now()}}
+           table: table, snapshot_id: {:as_of, DateTime.utc_now()}}
         ]
 
     case Supervisor.start_link(children, strategy: :rest_for_one) do
       {:ok, supervisor} ->
         status = await(supervisor)
-        # Stops the pipeline, then the QuackDB pool, then DuckDB itself.
+        # Stopping Broadway also stops its managed QuackDB pool and DuckDB server.
         if Process.alive?(supervisor), do: Supervisor.stop(supervisor)
         status
 

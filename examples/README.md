@@ -8,8 +8,9 @@ nothing else: no credentials, no Docker, and no DuckDB to install or start.
 
 It demonstrates:
 
-- DuckDB managed by QuackDB under the script's own supervision tree.
-- Attaching an Iceberg REST catalog before the pipeline starts.
+- DuckDB and QuackDB pool supervised by Broadway through its producer startup hook.
+- Loading the Iceberg extensions and attaching a REST catalog in DuckDB's boot SQL,
+  before the QuackDB pool and Broadway pipeline start.
 - Reading a snapshot selected by one fixed as-of timestamp for the run.
 - `QuackDB.Columns` batches of at most 5,000 rows, processed with backpressure by two
   processors that each take one batch at a time.
@@ -35,6 +36,10 @@ tables as they are. The tests of this repository do not depend on it.
 
 ### Running it
 
+> **Draft dependency:** The examples in this branch assume a future QuackDB
+> `:init_sql` server option. They cannot run with the currently pinned QuackDB
+> `~> 0.7.0` release until that upstream change is available.
+
 From the repository root, so that mise picks up the project's toolchain:
 
 ```shell
@@ -51,8 +56,6 @@ The output looks like this; the snapshot, batch boundaries and timings come from
 
 ```text
 Starting DuckDB (the first run downloads it)...
-Connecting to the public Iceberg catalog...
-Catalog attached.
 
 Reading pubdata.environment.earthquakes
 Snapshot: 5964070490105136742
@@ -75,10 +78,10 @@ batch.
 
 ### How it works
 
-`QuackDB.Server.child_specs/1` starts DuckDB as a local process and a QuackDB pool connected
-to it. The pipeline is the next child. Before starting Broadway, it installs and loads the
-extensions and attaches the catalog as `pubdata`. Stopping the supervisor stops the pipeline,
-then the pool, then DuckDB.
+Broadway's producer startup hook creates one managed DuckDB server and QuackDB pool.
+The proposed `:init_sql` option loads the extensions and attaches `pubdata` before
+DuckDB starts serving. All producer stages share the pool. Stopping Broadway also
+stops its pool and DuckDB.
 
 The script chooses an as-of timestamp once, when it builds its supervision tree. The
 producer resolves the snapshot that was current then, prints it in `Snapshot:`, and
@@ -104,7 +107,7 @@ if the tree fails to start, for example when the catalog cannot be attached.
 
 ### Troubleshooting
 
-- **`Could not start` while attaching the catalog.** Check that the catalog answers:
+- **`Could not start` during DuckDB initialization.** Check that the catalog answers:
   `curl "https://public-catalog.lakehousebox.com/v1/config?warehouse=commons/pubdata"` should
   return JSON. A proxy or firewall that blocks it blocks DuckDB too.
 - **TLS errors.** DuckDB makes the HTTPS requests to the catalog and its data files, not the

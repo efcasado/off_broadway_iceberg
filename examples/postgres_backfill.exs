@@ -127,25 +127,8 @@ defmodule PostgresBackfill.Pipeline do
   alias Broadway.Message
 
   def start_link(opts) do
-    duckdb = Keyword.fetch!(opts, :duckdb)
     postgres = Keyword.fetch!(opts, :postgres)
 
-    # Set up once, before Broadway starts, so that a failure stops the startup with the
-    # actual error. It runs again whenever a restarted DuckDB restarts the pipeline.
-    IO.puts("Connecting to the public Iceberg catalog...")
-
-    for extension <- ["iceberg", "httpfs"] do
-      QuackDB.query!(duckdb, "INSTALL #{extension}")
-      QuackDB.query!(duckdb, "LOAD #{extension}")
-    end
-
-    QuackDB.query!(
-      duckdb,
-      "ATTACH IF NOT EXISTS 'commons/pubdata' AS pubdata " <>
-        "(TYPE iceberg, URI 'https://public-catalog.lakehousebox.com', AUTHORIZATION_TYPE 'none')"
-    )
-
-    IO.puts("Catalog attached.")
     Earthquakes.create_tables!(postgres)
     IO.puts("PostgreSQL tables ready.\n")
 
@@ -154,7 +137,23 @@ defmodule PostgresBackfill.Pipeline do
       producer: [
         module:
           {OffBroadway.Iceberg.Producer,
-           connection: duckdb,
+           managed: [
+             server: [
+               # Proposed upstream QuackDB option; unavailable in 0.7.x.
+               init_sql: """
+               INSTALL iceberg;
+               LOAD iceberg;
+               INSTALL httpfs;
+               LOAD httpfs;
+               ATTACH 'commons/pubdata' AS pubdata (
+                 TYPE iceberg,
+                 URI 'https://public-catalog.lakehousebox.com',
+                 AUTHORIZATION_TYPE 'none'
+               );
+               """
+             ],
+             client: [pool_size: 2]
+           ],
            table: "pubdata.environment.earthquakes",
            snapshot_id: Keyword.fetch!(opts, :snapshot_id),
            fetch_size: 5_000},
@@ -207,18 +206,13 @@ defmodule PostgresBackfill do
     IO.puts("Starting DuckDB (the first run downloads it)...")
 
     children =
-      QuackDB.Server.child_specs(
-        server: [name: PostgresBackfill.DuckDB, duckdb: :managed],
-        client: [name: PostgresBackfill.QuackDB, pool_size: 2]
-      ) ++
-        [
-          # Both pools are DBConnection pools, whose child ids would clash.
+      [
+          # PostgreSQL is a separate pool; Broadway supervises its own QuackDB pool.
           Supervisor.child_spec(
             {Postgrex, postgres_options(database_url) ++ [name: PostgresBackfill.Postgres, pool_size: 4]},
             id: PostgresBackfill.Postgres
           ),
           {PostgresBackfill.Pipeline,
-           duckdb: PostgresBackfill.QuackDB,
            postgres: PostgresBackfill.Postgres,
            snapshot_id: {:as_of, DateTime.utc_now()}}
         ]
@@ -227,7 +221,7 @@ defmodule PostgresBackfill do
       {:ok, supervisor} ->
         status = await(supervisor)
         if status == 0, do: report_tables()
-        # Stops the pipeline, the PostgreSQL pool, the QuackDB pool, then DuckDB itself.
+        # Stops the PostgreSQL pool and Broadway, including Broadway's managed DuckDB.
         if Process.alive?(supervisor), do: Supervisor.stop(supervisor)
         status
 
