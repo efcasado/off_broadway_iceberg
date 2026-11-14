@@ -33,7 +33,9 @@ defmodule CheckpointedBackfill.Pipeline do
   @table ["pubdata", "places", "admin_areas"]
 
   def start_link(opts) do
-    connection = Keyword.fetch!(opts, :connection)
+    # Managed QuackDB starts before the producer stages. Snapshot selection still
+    # needs a connection; the pool name is derived from this Broadway pipeline.
+    connection = Module.concat(__MODULE__, QuackDB)
 
     # A checkpointed job reads one snapshot on every run, so pin the current one, and
     # name the job after it. With a :slice_rows of 1, every data file makes a slice.
@@ -44,7 +46,23 @@ defmodule CheckpointedBackfill.Pipeline do
       producer: [
         module:
           {OffBroadway.Iceberg.Producer,
-           connection: connection,
+           managed: [
+             server: [
+               # Proposed upstream QuackDB option; unavailable in 0.7.x.
+               init_sql: """
+               INSTALL iceberg;
+               LOAD iceberg;
+               INSTALL httpfs;
+               LOAD httpfs;
+               ATTACH 'commons/pubdata' AS pubdata (
+                 TYPE iceberg,
+                 URI 'https://public-catalog.lakehousebox.com',
+                 AUTHORIZATION_TYPE 'none'
+               );
+               """
+             ],
+             client: [pool_size: 2]
+           ]
            table: @table,
            snapshot_id: snapshot_id,
            fetch_size: 1_000,
@@ -106,27 +124,8 @@ defmodule CheckpointedBackfill do
       IO.puts("Starting DuckDB (the first run downloads it)...")
 
       children =
-        QuackDB.Server.child_specs(
-          server: [
-            name: CheckpointedBackfill.DuckDB,
-            duckdb: :managed,
-            # Proposed upstream QuackDB :init_sql; not yet supported in ~> 0.7.0.
-            init_sql: """
-            INSTALL iceberg;
-            LOAD iceberg;
-            INSTALL httpfs;
-            LOAD httpfs;
-            ATTACH 'commons/pubdata' AS pubdata (
-              TYPE iceberg,
-              URI 'https://public-catalog.lakehousebox.com',
-              AUTHORIZATION_TYPE 'none'
-            );
-            """
-          ],
-          client: [name: CheckpointedBackfill.QuackDB, pool_size: 2]
-        ) ++
-          [
-            {CheckpointedBackfill.Pipeline, connection: CheckpointedBackfill.QuackDB, bucket: @bucket, endpoint: endpoint}
+        [
+            {CheckpointedBackfill.Pipeline, bucket: @bucket, endpoint: endpoint}
           ]
 
       case Supervisor.start_link(children, strategy: :rest_for_one) do
