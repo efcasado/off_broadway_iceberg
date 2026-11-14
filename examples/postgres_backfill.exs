@@ -130,22 +130,7 @@ defmodule PostgresBackfill.Pipeline do
     duckdb = Keyword.fetch!(opts, :duckdb)
     postgres = Keyword.fetch!(opts, :postgres)
 
-    # Set up once, before Broadway starts, so that a failure stops the startup with the
-    # actual error. It runs again whenever a restarted DuckDB restarts the pipeline.
-    IO.puts("Connecting to the public Iceberg catalog...")
-
-    for extension <- ["iceberg", "httpfs"] do
-      QuackDB.query!(duckdb, "INSTALL #{extension}")
-      QuackDB.query!(duckdb, "LOAD #{extension}")
-    end
-
-    QuackDB.query!(
-      duckdb,
-      "ATTACH IF NOT EXISTS 'commons/pubdata' AS pubdata " <>
-        "(TYPE iceberg, URI 'https://public-catalog.lakehousebox.com', AUTHORIZATION_TYPE 'none')"
-    )
-
-    IO.puts("Catalog attached.")
+    # The DuckDB server has already loaded Iceberg and attached the catalog.
     Earthquakes.create_tables!(postgres)
     IO.puts("PostgreSQL tables ready.\n")
 
@@ -208,7 +193,22 @@ defmodule PostgresBackfill do
 
     children =
       QuackDB.Server.child_specs(
-        server: [name: PostgresBackfill.DuckDB, duckdb: :managed],
+        server: [
+            name: PostgresBackfill.DuckDB,
+            duckdb: :managed,
+            # Proposed upstream QuackDB :init_sql; not yet supported in ~> 0.7.0.
+            init_sql: """
+            INSTALL iceberg;
+            LOAD iceberg;
+            INSTALL httpfs;
+            LOAD httpfs;
+            ATTACH 'commons/pubdata' AS pubdata (
+              TYPE iceberg,
+              URI 'https://public-catalog.lakehousebox.com',
+              AUTHORIZATION_TYPE 'none'
+            );
+            """
+          ],
         client: [name: PostgresBackfill.QuackDB, pool_size: 2]
       ) ++
         [
