@@ -375,6 +375,58 @@ defmodule OffBroadway.Iceberg.DistributionTest do
   end
 
   describe "a distributed scan" do
+    test "each slice is opened once when all producers join before demand" do
+      pool = start_pool(files: @files, pool_size: 4)
+      table = unique_table()
+      Telemetry.attach_scan(table)
+
+      members = for id <- [:a, :b, :c], do: {id, start_member(pool, table, id)}
+
+      # Wait until all producers agree on membership before issuing any demand.
+      # Joining later during a read can legitimately cause duplicate work.
+      pids = Enum.map(members, fn {_id, %{producer: producer}} -> producer end)
+
+      assert Enum.any?(1..100, fn _attempt ->
+               if Enum.all?(pids, fn pid ->
+                    state = :sys.get_state(pid).state
+                    state.group != nil and Enum.sort(state.members) == Enum.sort(pids)
+                  end) do
+                 true
+               else
+                 Process.sleep(10)
+                 false
+               end
+             end)
+
+      Enum.each(members, fn {_id, %{consumer: consumer}} -> ManualConsumer.ask(consumer, 1_000) end)
+
+      for _ <- members do
+        assert_receive {:telemetry, [:off_broadway_iceberg, :scan, :stop],
+                        %{rows: @rows, batches: @batches, failed_batches: 0}, _}, 5_000
+      end
+
+      # The FakeConnection records each actual DuckDB cursor opened, independently
+      # of the final messages. If two producers read a slice, this catches it.
+      events = flush()
+
+      declared_paths =
+        for {:fake, {:declare, _statement, [42 | paths], 5}} <- events,
+            path <- paths,
+            do: path
+
+      expected_paths = Enum.map(@files, &elem(&1, 0))
+      assert Enum.sort(declared_paths) == expected_paths
+
+      # All three producers did the metadata planning independently.
+      plans =
+        for {:fake,
+             {:query, "SELECT file_path, record_count FROM iceberg_files(?, snapshot_from_id => ?)" <> _, [_, 42]}} <-
+              events,
+            do: true
+
+      assert length(plans) == length(members)
+    end
+
     test "is not reported complete while this producer's messages are still being processed" do
       pool = start_pool(files: @files)
       table = unique_table()
