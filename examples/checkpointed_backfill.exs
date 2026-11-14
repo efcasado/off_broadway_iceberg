@@ -35,19 +35,6 @@ defmodule CheckpointedBackfill.Pipeline do
   def start_link(opts) do
     connection = Keyword.fetch!(opts, :connection)
 
-    IO.puts("Connecting to the public Iceberg catalog...")
-
-    for extension <- ["iceberg", "httpfs"] do
-      QuackDB.query!(connection, "INSTALL #{extension}")
-      QuackDB.query!(connection, "LOAD #{extension}")
-    end
-
-    QuackDB.query!(
-      connection,
-      "ATTACH IF NOT EXISTS 'commons/pubdata' AS pubdata " <>
-        "(TYPE iceberg, URI 'https://public-catalog.lakehousebox.com', AUTHORIZATION_TYPE 'none')"
-    )
-
     # A checkpointed job reads one snapshot on every run, so pin the current one, and
     # name the job after it. With a :slice_rows of 1, every data file makes a slice.
     snapshot_id = current_snapshot(connection)
@@ -120,7 +107,22 @@ defmodule CheckpointedBackfill do
 
       children =
         QuackDB.Server.child_specs(
-          server: [name: CheckpointedBackfill.DuckDB, duckdb: :managed],
+          server: [
+            name: CheckpointedBackfill.DuckDB,
+            duckdb: :managed,
+            # Proposed upstream QuackDB :init_sql; not yet supported in ~> 0.7.0.
+            init_sql: """
+            INSTALL iceberg;
+            LOAD iceberg;
+            INSTALL httpfs;
+            LOAD httpfs;
+            ATTACH 'commons/pubdata' AS pubdata (
+              TYPE iceberg,
+              URI 'https://public-catalog.lakehousebox.com',
+              AUTHORIZATION_TYPE 'none'
+            );
+            """
+          ],
           client: [name: CheckpointedBackfill.QuackDB, pool_size: 2]
         ) ++
           [
