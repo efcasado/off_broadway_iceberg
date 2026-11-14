@@ -28,8 +28,6 @@ defmodule PublicCatalog.Backfill do
   alias Broadway.Message
 
   def start_link(opts) do
-    connection = Keyword.fetch!(opts, :connection)
-
     Broadway.start_link(__MODULE__,
       name: __MODULE__,
       producer: [
@@ -51,7 +49,7 @@ defmodule PublicCatalog.Backfill do
                """
              ],
              client: [pool_size: 2]
-           ]
+           ],
            table: "pubdata." <> Keyword.fetch!(opts, :table),
            snapshot_id: Keyword.fetch!(opts, :snapshot_id),
            fetch_size: 5_000},
@@ -115,7 +113,7 @@ defmodule PublicCatalog do
     case Supervisor.start_link(children, strategy: :rest_for_one) do
       {:ok, supervisor} ->
         status = await(supervisor)
-        # Stops the pipeline, then the QuackDB pool, then DuckDB itself.
+        # Stopping Broadway also stops its managed QuackDB pool and DuckDB server.
         if Process.alive?(supervisor), do: Supervisor.stop(supervisor)
         status
 
