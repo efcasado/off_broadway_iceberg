@@ -8,7 +8,7 @@ nothing else: no credentials, no Docker, and no DuckDB to install or start.
 
 It demonstrates:
 
-- DuckDB managed by QuackDB under the script's own supervision tree.
+- DuckDB and QuackDB pool supervised by Broadway through its producer startup hook.
 - Loading the Iceberg extensions and attaching a REST catalog in DuckDB's boot SQL,
   before the QuackDB pool and Broadway pipeline start.
 - Reading a snapshot selected by one fixed as-of timestamp for the run.
@@ -78,11 +78,10 @@ batch.
 
 ### How it works
 
-`QuackDB.Server.child_specs/1` starts DuckDB as a local process and a QuackDB pool connected
-to it. The proposed `:init_sql` option installs and loads the extensions and
-attaches the catalog as `pubdata` **before DuckDB starts serving**. The pipeline
-starts only after the server and pool are ready. Stopping the supervisor stops the pipeline,
-then the pool, then DuckDB.
+Broadway's producer startup hook creates one managed DuckDB server and QuackDB pool.
+The proposed `:init_sql` option loads the extensions and attaches `pubdata` before
+DuckDB starts serving. All producer stages share the pool. Stopping Broadway also
+stops its pool and DuckDB.
 
 The script chooses an as-of timestamp once, when it builds its supervision tree. The
 producer resolves the snapshot that was current then, prints it in `Snapshot:`, and
