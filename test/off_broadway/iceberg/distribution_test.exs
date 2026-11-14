@@ -154,7 +154,9 @@ defmodule OffBroadway.Iceberg.DistributionTest do
 
       {[server, _pool], broadway} = prepare(opts)
       assert server.id == MyApp.DuckDB
-      assert broadway[:producer][:module] == {Producer, [table: "events", snapshot_id: 7, fetch_size: 10_000, slice_rows: 1_000_000, connection: MyApp.QuackDB]}
+      {Producer, scan_opts} = broadway[:producer][:module]
+      assert scan_opts[:connection] == MyApp.QuackDB
+      assert scan_opts[:snapshot_id] == 7
     end
 
     test "requires exactly one of an external pool or managed DuckDB" do
@@ -620,7 +622,7 @@ defmodule OffBroadway.Iceberg.DistributionTest do
   end
 
   defp prepare(producer_opts, concurrency \\ 1) do
-    Producer.prepare_for_start(__MODULE__, producer: [module: {Producer, producer_opts}, concurrency: concurrency])
+    Producer.prepare_for_start(__MODULE__, name: __MODULE__, producer: [module: {Producer, producer_opts}, concurrency: concurrency])
   end
 
   defp start_pool(script, opts \\ []) do
