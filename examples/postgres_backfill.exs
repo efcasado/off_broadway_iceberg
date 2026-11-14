@@ -153,7 +153,7 @@ defmodule PostgresBackfill.Pipeline do
                """
              ],
              client: [pool_size: 2]
-           ]
+           ],
            table: "pubdata.environment.earthquakes",
            snapshot_id: Keyword.fetch!(opts, :snapshot_id),
            fetch_size: 5_000},
@@ -207,7 +207,7 @@ defmodule PostgresBackfill do
 
     children =
       [
-          # Both pools are DBConnection pools, whose child ids would clash.
+          # PostgreSQL is a separate pool; Broadway supervises its own QuackDB pool.
           Supervisor.child_spec(
             {Postgrex, postgres_options(database_url) ++ [name: PostgresBackfill.Postgres, pool_size: 4]},
             id: PostgresBackfill.Postgres
@@ -221,7 +221,7 @@ defmodule PostgresBackfill do
       {:ok, supervisor} ->
         status = await(supervisor)
         if status == 0, do: report_tables()
-        # Stops the pipeline, the PostgreSQL pool, the QuackDB pool, then DuckDB itself.
+        # Stops the PostgreSQL pool and Broadway, including Broadway's managed DuckDB.
         if Process.alive?(supervisor), do: Supervisor.stop(supervisor)
         status
 
