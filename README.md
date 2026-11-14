@@ -42,21 +42,40 @@ end
 ## Usage
 
 Run DuckDB under your application's supervision tree with QuackDB, next to a QuackDB
-connection pool:
+connection pool. Configure its Iceberg extension and catalog **at server startup**, before
+the pool and Broadway are started:
+
+> #### Proposed QuackDB API {: .warning}
+>
+> This example assumes an upstream QuackDB `:init_sql` option that **appends** SQL
+> between QuackDB's generated extension/settings setup and `quack_serve(...)`.
+> QuackDB `~> 0.7.0` does not support that option yet; this branch is a draft of
+> the desired integration, not runnable until upstream adds it.
 
 ```elixir
 children =
   QuackDB.Server.child_specs(
-    server: [name: MyApp.DuckDB, duckdb: :managed],
+    server: [
+      name: MyApp.DuckDB,
+      duckdb: :managed,
+      init_sql: """
+      INSTALL iceberg;
+      LOAD iceberg;
+      ATTACH 'warehouse' AS lake (
+        TYPE iceberg,
+        URI 'http://localhost:8181',
+        AUTHORIZATION_TYPE 'none'
+      );
+      """
+    ],
     client: [name: MyApp.QuackDB, pool_size: 2]
   ) ++ [MyApp.IcebergBackfill]
 
 Supervisor.start_link(children, strategy: :rest_for_one)
 ```
 
-Then load the `iceberg` extension, attach the catalog, and start the pipeline. Extensions
-and attached catalogs belong to the DuckDB server, so this runs again whenever a restarted
-server restarts the pipeline:
+The Broadway pipeline now only configures the scan; it does not need to install
+extensions or attach the catalog:
 
 ```elixir
 defmodule MyApp.IcebergBackfill do
@@ -65,15 +84,6 @@ defmodule MyApp.IcebergBackfill do
   alias Broadway.Message
 
   def start_link(_opts) do
-    QuackDB.query!(MyApp.QuackDB, "INSTALL iceberg")
-    QuackDB.query!(MyApp.QuackDB, "LOAD iceberg")
-
-    QuackDB.query!(
-      MyApp.QuackDB,
-      "ATTACH IF NOT EXISTS 'warehouse' AS lake " <>
-        "(TYPE iceberg, URI 'http://localhost:8181', AUTHORIZATION_TYPE 'none')"
-    )
-
     Broadway.start_link(__MODULE__,
       name: __MODULE__,
       producer: [
@@ -123,17 +133,15 @@ pipelines run on one machine, give each its share:
 server: [name: MyApp.DuckDB, duckdb: :managed, settings: [threads: 4, memory_limit: "4GB"]]
 ```
 
-Run the setup in the pipeline's `start_link`, before `Broadway.start_link/2`, as above. It
-runs once, it fails the startup with the actual error, and it runs again whenever DuckDB
-restarts, because the supervisor then restarts the pipeline too. Two other places look
-natural but are not reliable:
+With the proposed `:init_sql`, QuackDB runs the setup **once per managed DuckDB
+startup**, before exposing the Quack endpoint. If setup fails, startup fails instead of
+letting Broadway query a partially initialized server. Restarts rerun the same boot
+SQL; no per-connection setup or separate initialization child is needed.
 
-- The pool's `:after_connect` option runs on every connection, at the same time. DuckDB
-  rejects all but one of the concurrent `ATTACH IF NOT EXISTS` with "already exists", and
-  DBConnection still hands out a connection whose setup failed. Scans then fail with errors
-  that do not name the cause.
-- A `Task` started before the pipeline does not wait for the setup to finish, so the scan
-  can start before the catalog is attached.
+This only applies when QuackDB manages DuckDB. For an external DuckDB instance,
+initialize the extensions and catalog in that server's own startup process before
+starting the Broadway pipeline. Avoid the pool's `:after_connect` for shared `ATTACH`
+statements: it runs independently on each connection and can race.
 
 ### Selecting columns and rows
 
