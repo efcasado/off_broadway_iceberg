@@ -40,29 +40,31 @@ defmodule OffBroadway.Iceberg.Producer do
 
   Options are validated in `c:Broadway.Producer.prepare_for_start/2`, so
   `Broadway.start_link/2` fails with the configuration error before any stage starts.
-  Any producer concurrency is supported. Give the QuackDB pool enough connections for
-  the producer stages that read concurrently on this node.
+  Any producer concurrency is supported. In managed mode, Broadway starts one DuckDB
+  and one QuackDB pool before its producer stages. Size the pool for concurrent reads.
 
   ## DuckDB setup
 
-  DuckDB must have the `iceberg` extension loaded and the catalog attached before the
-  scan starts. Both apply to the whole DuckDB instance, so running them on any
-  connection of the pool is enough:
+  Supply either `:connection`, an existing QuackDB pool, or `:managed`, which
+  supervises one DuckDB server and pool **per Broadway topology** through
+  `prepare_for_start/2`, regardless of producer concurrency:
 
-      QuackDB.query!(MyApp.QuackDB, "INSTALL iceberg")
-      QuackDB.query!(MyApp.QuackDB, "LOAD iceberg")
+      managed: [
+        server: [
+          init_sql: """
+          INSTALL iceberg;
+          LOAD iceberg;
+          ATTACH 'warehouse' AS lake
+            (TYPE iceberg, URI 'http://localhost:8181', AUTHORIZATION_TYPE 'none');
+          """
+        ],
+        client: [pool_size: 4]
+      ]
 
-      QuackDB.query!(
-        MyApp.QuackDB,
-        "ATTACH IF NOT EXISTS 'warehouse' AS lake " <>
-          "(TYPE iceberg, URI 'http://localhost:8181', AUTHORIZATION_TYPE 'none')"
-      )
-
-  `AUTHORIZATION_TYPE 'none'` suits a catalog without authentication. See DuckDB's
-  Iceberg documentation for catalogs that need credentials.
-
-  Only tables of an attached Iceberg catalog are supported. Paths read with
-  `iceberg_scan(...)` are not.
+  The `:init_sql` option is **proposed upstream** and is not present in the currently
+  pinned QuackDB release. With `:connection`, initialize the catalog yourself before
+  starting Broadway. Only attached Iceberg catalog tables are supported, not
+  `iceberg_scan(...)` paths.
 
   ## Snapshots
 
@@ -433,9 +435,29 @@ defmodule OffBroadway.Iceberg.Producer do
   def prepare_for_start(_module, broadway_opts) do
     producer = Keyword.fetch!(broadway_opts, :producer)
     {_producer_module, producer_opts} = Keyword.fetch!(producer, :module)
+    opts = Options.validate!(producer_opts)
 
-    Options.validate!(producer_opts)
-    {[], broadway_opts}
+    case Keyword.pop(opts, :managed) do
+      {nil, _external_opts} ->
+        {[], broadway_opts}
+
+      {managed, scan_opts} ->
+        name = Keyword.fetch!(broadway_opts, :name)
+        server_opts = Keyword.fetch!(managed, :server)
+        client_opts = Keyword.get(managed, :client, [])
+        server_name = Keyword.get(server_opts, :name, Module.concat(name, DuckDB))
+        pool_name = Keyword.get(client_opts, :name, Module.concat(name, QuackDB))
+
+        children =
+          QuackDB.Server.child_specs(
+            server: server_opts |> Keyword.put_new(:name, server_name) |> Keyword.put_new(:duckdb, :managed),
+            client: Keyword.put_new(client_opts, :name, pool_name)
+          )
+
+        module_opts = Keyword.put(scan_opts, :connection, pool_name)
+        updated_producer = Keyword.put(producer, :module, {__MODULE__, module_opts})
+        {children, Keyword.put(broadway_opts, :producer, updated_producer)}
+    end
   end
 
   @impl GenStage
