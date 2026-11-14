@@ -5,6 +5,11 @@ data files, join the producers reading that plan, and read the slices this produ
 A single producer owns every slice. More producers share the work, whether they run in
 the same Broadway pipeline or on other connected Erlang nodes.
 
+**Every producer independently plans the entire snapshot, but executes only the slices
+assigned to it. Planning is replicated; data processing is distributed.** Slice
+ownership is best-effort, not an exclusive lock: work can overlap while membership
+changes, after failures, or across network partitions.
+
 This guide follows a pipeline named `MyApp.Backfill`, running on two app instances:
 node A has producer concurrency 2 and node B has producer concurrency 1. All three
 producers read the same table and snapshot.
