@@ -153,7 +153,11 @@ defmodule PostgresBackfill.Pipeline do
       name: __MODULE__,
       producer: [
         module:
-          {OffBroadway.Iceberg.Producer, connection: duckdb, table: "pubdata.environment.earthquakes", fetch_size: 5_000},
+          {OffBroadway.Iceberg.Producer,
+           connection: duckdb,
+           table: "pubdata.environment.earthquakes",
+           snapshot_id: Keyword.fetch!(opts, :snapshot_id),
+           fetch_size: 5_000},
         concurrency: 1
       ],
       processors: [
@@ -174,7 +178,9 @@ defmodule PostgresBackfill.Pipeline do
     written = Earthquakes.store!(context.postgres, valid)
     Earthquakes.reject!(context.postgres, rejected)
 
-    IO.puts("Batch #{metadata.batch_index}: #{batch.num_rows} rows, #{written} written, #{length(rejected)} rejected")
+    IO.puts(
+      "Slice #{metadata.slice}, batch #{metadata.batch_index}: #{batch.num_rows} rows, #{written} written, #{length(rejected)} rejected"
+    )
 
     message
   end
@@ -211,7 +217,10 @@ defmodule PostgresBackfill do
             {Postgrex, postgres_options(database_url) ++ [name: PostgresBackfill.Postgres, pool_size: 4]},
             id: PostgresBackfill.Postgres
           ),
-          {PostgresBackfill.Pipeline, duckdb: PostgresBackfill.QuackDB, postgres: PostgresBackfill.Postgres}
+          {PostgresBackfill.Pipeline,
+           duckdb: PostgresBackfill.QuackDB,
+           postgres: PostgresBackfill.Postgres,
+           snapshot_id: {:as_of, DateTime.utc_now()}}
         ]
 
     case Supervisor.start_link(children, strategy: :rest_for_one) do

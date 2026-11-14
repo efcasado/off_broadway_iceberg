@@ -48,6 +48,39 @@ defmodule OffBroadway.Iceberg.ClusterTest do
     assert length(a) + length(b) < 2 * @batches, "each node read the whole scan"
   end
 
+  test "named pipelines with different local concurrency share the same scan across nodes", %{table: table} do
+    name = :"pipeline_#{System.unique_integer([:positive])}"
+
+    for {tag, concurrency} <- [a: 1, b: 3] do
+      {_peer, node} = start_node(tag)
+
+      :erpc.call(node, Member, :start_pipeline, [
+        self(),
+        tag,
+        [
+          name: name,
+          files: @files,
+          table: table,
+          snapshot_id: 42,
+          fetch_size: 5,
+          slice_rows: 10,
+          producer_concurrency: concurrency
+        ]
+      ])
+    end
+
+    # Hold processing until all four stages have planned the scan. This also exercises
+    # Broadway's pipeline name propagation; stage indexes must not split the group.
+    for _stage <- 1..4 do
+      assert_receive {:telemetry, [:off_broadway_iceberg, :scan, :start], _, %{name: ^name}}, 10_000
+    end
+
+    messages = collect_pipeline(name, 4)
+    assert messages |> Enum.map(&elem(&1, 0)) |> Enum.uniq() |> Enum.sort() == [:a, :b]
+    assert messages |> Enum.map(&elem(&1, 1)) |> ids() |> Enum.uniq() |> Enum.sort() == Enum.to_list(0..(@rows - 1))
+    assert length(messages) < 2 * @batches, "each app instance read the whole scan"
+  end
+
   test "a node that leaves mid-scan has its slices read by the others", %{table: table} do
     node_a = start_node(:a)
     {peer_b, _node} = node_b = start_node(:b)
@@ -89,7 +122,7 @@ defmodule OffBroadway.Iceberg.ClusterTest do
           table: table,
           snapshot_id: 42,
           fetch_size: 5,
-          distribute: [slice_rows: 10]
+          slice_rows: 10
         ],
         opts
       )
@@ -102,6 +135,26 @@ defmodule OffBroadway.Iceberg.ClusterTest do
       {:messages, ^tag, more} -> received(tag, messages ++ more)
     after
       0 -> messages
+    end
+  end
+
+  defp collect_pipeline(name, remaining, messages \\ [])
+  defp collect_pipeline(_name, 0, messages), do: messages
+
+  defp collect_pipeline(name, remaining, messages) do
+    receive do
+      {:handled, tag, message, processor} ->
+        send(processor, :continue)
+        collect_pipeline(name, remaining, [{tag, message} | messages])
+
+      {:telemetry, [:off_broadway_iceberg, :scan, :stop], measurements, %{name: ^name}} ->
+        assert %{rows: @rows, batches: @batches, failed_batches: 0} = measurements
+        collect_pipeline(name, remaining - 1, messages)
+
+      {:telemetry, [:off_broadway_iceberg, :scan, :exception], _, %{name: ^name} = metadata} ->
+        flunk("pipeline scan failed: #{inspect(metadata.reason)}")
+    after
+      10_000 -> flunk("#{remaining} producer stages did not complete")
     end
   end
 

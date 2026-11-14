@@ -1,6 +1,6 @@
 defmodule OffBroadway.Iceberg.Checkpoint do
   @moduledoc """
-  A place to record the finished slices of a distributed scan, so that a scan started
+  A place to record the finished slices of a scan, so that a scan started
   again, after its producers restart or the whole cluster does, does not read them again.
 
   `OffBroadway.Iceberg.Checkpoint.GCS` records them in Google Cloud Storage. See

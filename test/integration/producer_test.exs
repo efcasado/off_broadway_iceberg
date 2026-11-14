@@ -44,7 +44,7 @@ defmodule OffBroadway.Iceberg.Integration.ProducerTest do
       assert ids(messages) == Enum.to_list(0..1_999)
     end
 
-    test ":current reads the snapshot of the main branch, which a rollback moves back", %{schema: schema} do
+    test "a fixed as-of timestamp reads the rolled-back main branch", %{schema: schema} do
       table = Iceberg.create_table!(@pool, schema)
       first = Iceberg.insert!(@pool, table, 0..99)
       _second = Iceberg.insert!(@pool, table, 100..199)
@@ -204,11 +204,10 @@ defmodule OffBroadway.Iceberg.Integration.ProducerTest do
 
       start_pipeline(name, table: table, snapshot_id: 123)
 
-      assert_receive {:telemetry, [:off_broadway_iceberg, :scan, :start], _, %{name: ^name, snapshot_id: 123}}, 30_000
-
       assert_receive {:telemetry, [:off_broadway_iceberg, :scan, :exception], %{batches: 0}, %{name: ^name} = metadata},
                      30_000
 
+      assert metadata.snapshot_id == nil
       assert %QuackDB.Error{message: message} = metadata.reason
       assert message =~ "Could not find snapshot with id 123"
       refute_receive {:telemetry, _event, _measurements, %{name: ^name}}, 500
@@ -289,19 +288,18 @@ defmodule OffBroadway.Iceberg.Integration.ProducerTest do
   end
 
   describe "distributed scans" do
-    test "rejects physical filename columns even when the projection excludes them", %{schema: schema} do
+    test "a single producer rejects physical filename columns even when not selected", %{schema: schema} do
       for column <- ["filename", "FileName"] do
         table = "#{schema}.filename_#{System.unique_integer([:positive])}"
         QuackDB.query!(@pool, ~s|CREATE TABLE #{table} (id BIGINT, "#{column}" VARCHAR)|)
         QuackDB.query!(@pool, "INSERT INTO #{table} VALUES (1, 'a.csv'), (2, 'b.csv')")
         snapshot = @pool |> Iceberg.snapshots(table) |> List.last()
 
-        {messages, %{rows: 2}, _metadata} = scan(table: table, snapshot_id: snapshot, columns: ["id"])
-        assert ids(messages) == [1, 2]
+        assert %{rows: [[1], [2]]} = QuackDB.query!(@pool, "SELECT id FROM #{table} ORDER BY id")
 
         name = unique_name()
         Telemetry.attach_pipeline(name)
-        start_pipeline(name, table: table, snapshot_id: snapshot, distribute: true, columns: ["id"])
+        start_pipeline(name, table: table, snapshot_id: snapshot, columns: ["id"])
 
         assert_receive {:telemetry, [:off_broadway_iceberg, :scan, outcome], measurements, %{name: ^name} = metadata}
                        when outcome in [:stop, :exception],
@@ -326,7 +324,7 @@ defmodule OffBroadway.Iceberg.Integration.ProducerTest do
       Telemetry.attach_pipeline(name)
 
       # Slices of at least 2,500 rows hold two files each.
-      start_pipeline(name, [table: table, snapshot_id: snapshot, fetch_size: 500, distribute: [slice_rows: 2_500]],
+      start_pipeline(name, [table: table, snapshot_id: snapshot, fetch_size: 500, slice_rows: 2_500],
         producer_concurrency: 2,
         processor_concurrency: 4,
         max_demand: 2
@@ -409,7 +407,7 @@ defmodule OffBroadway.Iceberg.Integration.ProducerTest do
           fetch_size: 100,
           columns: ["payload", "id"],
           where: {"id % ? = 0 AND id < ?", [3, 5_500]},
-          distribute: [slice_rows: 1_000]
+          slice_rows: 1_000
         ],
         producer_concurrency: 2,
         processor_concurrency: 4,
@@ -454,7 +452,7 @@ defmodule OffBroadway.Iceberg.Integration.ProducerTest do
             snapshot_id: snapshot,
             columns: ["id"],
             where: {where, [10, 5_000, 5_004]},
-            distribute: [slice_rows: 1_000]
+            slice_rows: 1_000
           ],
           producer_concurrency: 2,
           processor_concurrency: 4,
@@ -484,8 +482,7 @@ defmodule OffBroadway.Iceberg.Integration.ProducerTest do
       start_pipeline(name,
         table: table,
         snapshot_id: snapshot,
-        columns: ["id", "amount"],
-        distribute: true
+        columns: ["id", "amount"]
       )
 
       assert_receive {:telemetry, [:off_broadway_iceberg, :scan, :exception], _measurements, %{name: ^name} = metadata},
@@ -562,7 +559,11 @@ defmodule OffBroadway.Iceberg.Integration.ProducerTest do
     pipeline_opts =
       opts
       |> Keyword.take([:handler, :producer_concurrency, :processor_concurrency, :max_demand])
-      |> Keyword.merge(name: name, test: self(), producer: Keyword.merge([connection: @pool], producer_opts))
+      |> Keyword.merge(
+        name: name,
+        test: self(),
+        producer: Keyword.merge([connection: @pool, snapshot_id: {:as_of, DateTime.utc_now()}], producer_opts)
+      )
 
     start_supervised!({Pipeline, pipeline_opts}, id: name, restart: :temporary)
   end

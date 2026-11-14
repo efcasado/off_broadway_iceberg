@@ -2,6 +2,7 @@ defmodule OffBroadway.Iceberg.DistributionTest do
   use ExUnit.Case, async: true
 
   alias OffBroadway.Iceberg.Distribution
+  alias OffBroadway.Iceberg.Options
   alias OffBroadway.Iceberg.Producer
   alias OffBroadway.Iceberg.Test.FakeConnection
   alias OffBroadway.Iceberg.Test.ManualConsumer
@@ -84,32 +85,45 @@ defmodule OffBroadway.Iceberg.DistributionTest do
   end
 
   describe "options" do
-    test "require a snapshot every node resolves the same way" do
-      assert_raise ArgumentError, ~r/requires an integer or \{:as_of, datetime\} :snapshot_id with :distribute/, fn ->
-        prepare(connection: MyApp.QuackDB, table: "events", distribute: true)
-      end
+    test "defaults the top-level slice target to one million rows" do
+      opts = Options.validate!(connection: MyApp.QuackDB, table: "events", snapshot_id: 7)
+      assert opts[:slice_rows] == 1_000_000
 
-      assert {[], _opts} = prepare(connection: MyApp.QuackDB, table: "events", snapshot_id: 7, distribute: true)
-
-      assert {[], _opts} =
-               prepare(
-                 connection: MyApp.QuackDB,
-                 table: "events",
-                 snapshot_id: {:as_of, DateTime.utc_now()},
-                 distribute: [slice_rows: 100]
-               )
+      opts = Options.validate!(connection: MyApp.QuackDB, table: "events", snapshot_id: 7, slice_rows: 25)
+      assert opts[:slice_rows] == 25
     end
 
-    test "reject anything but true or a positive :slice_rows" do
-      for distribute <- [[slice_rows: 0], [slice_rows: "10"], [slices: 4], :yes] do
-        assert_raise NimbleOptions.ValidationError, ~r/:distribute/, fn ->
+    test "requires a fixed snapshot" do
+      assert_raise NimbleOptions.ValidationError, ~r/required :snapshot_id option not found/, fn ->
+        prepare(connection: MyApp.QuackDB, table: "events")
+      end
+
+      assert_raise NimbleOptions.ValidationError, ~r/:snapshot_id/, fn ->
+        prepare(connection: MyApp.QuackDB, table: "events", snapshot_id: :current)
+      end
+
+      assert {[], _opts} = prepare(connection: MyApp.QuackDB, table: "events", snapshot_id: 7)
+
+      assert {[], _opts} =
+               prepare(connection: MyApp.QuackDB, table: "events", snapshot_id: {:as_of, ~U[2026-11-12 00:00:00Z]})
+    end
+
+    test "rejects non-positive slice targets and the removed distribute option" do
+      for slice_rows <- [0, -1, "10", true, nil] do
+        assert_raise NimbleOptions.ValidationError, ~r/:slice_rows/, fn ->
+          prepare(connection: MyApp.QuackDB, table: "events", snapshot_id: 7, slice_rows: slice_rows)
+        end
+      end
+
+      for distribute <- [true, false, [slice_rows: 10]] do
+        assert_raise NimbleOptions.ValidationError, ~r/unknown options.*distribute/, fn ->
           prepare(connection: MyApp.QuackDB, table: "events", snapshot_id: 7, distribute: distribute)
         end
       end
     end
 
-    test "allow more than one producer stage" do
-      assert {[], _opts} = prepare([connection: MyApp.QuackDB, table: "events", snapshot_id: 7, distribute: true], 4)
+    test "allows more than one producer stage" do
+      assert {[], _opts} = prepare([connection: MyApp.QuackDB, table: "events", snapshot_id: 7], 4)
     end
   end
 
@@ -142,12 +156,26 @@ defmodule OffBroadway.Iceberg.DistributionTest do
   end
 
   describe "planning" do
+    test "one producer groups files into slices using the default target" do
+      pool = start_pool(files: @files)
+      table = unique_table()
+      Telemetry.attach_scan(table)
+      producer = start_supervised!({Producer, connection: pool, table: table, snapshot_id: 42, fetch_size: 5})
+      {:ok, consumer} = ManualConsumer.start_link(producer, ack: true)
+      ManualConsumer.ask(consumer, 1_000)
+
+      assert_receive {:telemetry, [:off_broadway_iceberg, :scan, :stop], %{rows: @rows, batches: @batches}, _}, 5_000
+      paths = Enum.map(@files, &elem(&1, 0))
+      assert_receive {:fake, {:declare, _statement, [42 | ^paths], 5}}
+      refute_received {:fake, {:declare, _statement, _params, _fetch_size}}
+    end
+
     test "groups small data files into slices of at least :slice_rows rows" do
       pool = start_pool(files: Enum.take(@files, 10))
       table = unique_table()
       Telemetry.attach_scan(table)
 
-      %{consumer: consumer} = start_member(pool, table, :a, distribute: [slice_rows: 25])
+      %{consumer: consumer} = start_member(pool, table, :a, slice_rows: 25)
       ManualConsumer.ask(consumer, 1_000)
 
       assert_receive {:telemetry, [:off_broadway_iceberg, :scan, :stop], %{rows: 100}, _}, 5_000
@@ -268,7 +296,7 @@ defmodule OffBroadway.Iceberg.DistributionTest do
         end
       end
 
-      producer = [connection: pool, table: table, snapshot_id: 42, fetch_size: 5, distribute: [slice_rows: 10]]
+      producer = [connection: pool, table: table, snapshot_id: 42, fetch_size: 5, slice_rows: 10]
       start_supervised!({Pipeline, name: name, handler: handler, producer: producer})
       assert_receive {:blocked, processor}
 
@@ -289,9 +317,7 @@ defmodule OffBroadway.Iceberg.DistributionTest do
 
       # Read every slice, without acknowledging anything yet.
       producer =
-        start_supervised!(
-          {Producer, connection: pool, table: table, snapshot_id: 42, fetch_size: 5, distribute: [slice_rows: 10]}
-        )
+        start_supervised!({Producer, connection: pool, table: table, snapshot_id: 42, fetch_size: 5, slice_rows: 10})
 
       {:ok, consumer} = ManualConsumer.start_link(producer, tag: :a)
       ManualConsumer.ask(consumer, 1_000)
@@ -334,9 +360,7 @@ defmodule OffBroadway.Iceberg.DistributionTest do
       Telemetry.attach_scan(table)
 
       producer =
-        start_supervised!(
-          {Producer, connection: pool, table: table, snapshot_id: 42, fetch_size: 5, distribute: [slice_rows: 10]}
-        )
+        start_supervised!({Producer, connection: pool, table: table, snapshot_id: 42, fetch_size: 5, slice_rows: 10})
 
       {:ok, consumer} = ManualConsumer.start_link(producer, tag: :a)
       ManualConsumer.ask(consumer, 1_000)
@@ -351,6 +375,58 @@ defmodule OffBroadway.Iceberg.DistributionTest do
   end
 
   describe "a distributed scan" do
+    test "each slice is opened once when all producers join before demand" do
+      pool = start_pool(files: @files, pool_size: 4)
+      table = unique_table()
+      Telemetry.attach_scan(table)
+
+      members = for id <- [:a, :b, :c], do: {id, start_member(pool, table, id)}
+
+      # Wait until all producers agree on membership before issuing any demand.
+      # Joining later during a read can legitimately cause duplicate work.
+      pids = Enum.map(members, fn {_id, %{producer: producer}} -> producer end)
+
+      assert Enum.any?(1..100, fn _attempt ->
+               if Enum.all?(pids, fn pid ->
+                    state = :sys.get_state(pid).state
+                    state.group != nil and Enum.sort(state.members) == Enum.sort(pids)
+                  end) do
+                 true
+               else
+                 Process.sleep(10)
+                 false
+               end
+             end)
+
+      Enum.each(members, fn {_id, %{consumer: consumer}} -> ManualConsumer.ask(consumer, 1_000) end)
+
+      for _ <- members do
+        assert_receive {:telemetry, [:off_broadway_iceberg, :scan, :stop],
+                        %{rows: @rows, batches: @batches, failed_batches: 0}, _}, 5_000
+      end
+
+      # The FakeConnection records each actual DuckDB cursor opened, independently
+      # of the final messages. If two producers read a slice, this catches it.
+      events = flush()
+
+      declared_paths =
+        for {:fake, {:declare, _statement, [42 | paths], 5}} <- events,
+            path <- paths,
+            do: path
+
+      expected_paths = Enum.map(@files, &elem(&1, 0))
+      assert Enum.sort(declared_paths) == expected_paths
+
+      # All three producers did the metadata planning independently.
+      plans =
+        for {:fake,
+             {:query, "SELECT file_path, record_count FROM iceberg_files(?, snapshot_from_id => ?)" <> _, [_, 42]}} <-
+              events,
+            do: true
+
+      assert length(plans) == length(members)
+    end
+
     test "is not reported complete while this producer's messages are still being processed" do
       pool = start_pool(files: @files)
       table = unique_table()
@@ -371,7 +447,7 @@ defmodule OffBroadway.Iceberg.DistributionTest do
         message
       end
 
-      producer = [connection: pool, table: table, snapshot_id: 42, fetch_size: 5, distribute: [slice_rows: 10]]
+      producer = [connection: pool, table: table, snapshot_id: 42, fetch_size: 5, slice_rows: 10]
       start_supervised!({Pipeline, name: name, handler: handler, producer: producer})
       assert_receive {:blocked, processor}
 
@@ -512,7 +588,7 @@ defmodule OffBroadway.Iceberg.DistributionTest do
   defp start_member(pool, table, id, opts \\ []) do
     opts =
       Keyword.merge(
-        [connection: pool, table: table, snapshot_id: 42, fetch_size: 5, distribute: [slice_rows: 10]],
+        [connection: pool, table: table, snapshot_id: 42, fetch_size: 5, slice_rows: 10],
         opts
       )
 

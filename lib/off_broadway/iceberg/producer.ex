@@ -2,17 +2,18 @@ defmodule OffBroadway.Iceberg.Producer do
   @moduledoc """
   A Broadway producer that reads one Apache Iceberg snapshot through DuckDB.
 
-  The producer runs `SELECT * FROM table AT (VERSION => snapshot_id)` on a
-  [QuackDB](https://hexdocs.pm/quackdb) connection, or reads only the columns and rows
-  that `:columns` and `:where` select, and emits the result as `Broadway.Message`s, one
-  message per fetched batch of rows. The snapshot is fixed for the whole scan, so commits
+  The producer plans a fixed snapshot into slices of whole data files, reads them on a
+  [QuackDB](https://hexdocs.pm/quackdb) connection with `AT (VERSION => snapshot_id)`,
+  and selects the columns and rows that `:columns` and `:where` specify. It emits
+  `Broadway.Message`s, one message per fetched batch of rows. The snapshot is fixed for
+  the whole scan, so commits
   made to the table while the scan runs are not read.
 
   An Iceberg snapshot is finite: once every row has been emitted, the producer
   stops fetching and stays idle. It does not poll for new snapshots.
 
-  With `:distribute`, the producers of the same pipeline on every connected node
-  share one scan between them. See "Distributed scans" in `start_link/1`.
+  Producers of the same pipeline on every connected node share the slices automatically.
+  A single producer owns every slice. See "Distributed scans" in `start_link/1`.
 
   See `start_link/1` for the configuration options.
   """
@@ -39,9 +40,8 @@ defmodule OffBroadway.Iceberg.Producer do
 
   Options are validated in `c:Broadway.Producer.prepare_for_start/2`, so
   `Broadway.start_link/2` fails with the configuration error before any stage starts.
-  Without `:distribute`, the producer only works with `producer: [concurrency: 1]`:
-  each producer stage would scan the whole snapshot, so more than one would deliver
-  every row more than once.
+  Any producer concurrency is supported. Give the QuackDB pool enough connections for
+  the producer stages that read concurrently on this node.
 
   ## DuckDB setup
 
@@ -66,10 +66,10 @@ defmodule OffBroadway.Iceberg.Producer do
 
   ## Snapshots
 
-  With `snapshot_id: :current`, the scan reads `iceberg_refs(table)` and pins the
-  snapshot of the `main` branch. That is the table's current snapshot, which after a
-  rollback is not necessarily the newest one. A table with no snapshots yields no
-  messages. With an explicit id, a snapshot that does not exist fails the scan.
+  `:snapshot_id` is required: an integer id or a fixed `{:as_of, datetime}`. An id that
+  does not exist fails the scan. `:current` is not accepted, since producers starting
+  at different times could resolve different snapshots and scan separately. Choose the
+  snapshot once in your job configuration and pass it to every producer.
 
   With `{:as_of, datetime}`, the scan reads `iceberg_history(table)`, the log of which
   snapshot was current when, and pins the one that was current at `datetime`. Every
@@ -89,7 +89,7 @@ defmodule OffBroadway.Iceberg.Producer do
   The scan then runs:
 
       SELECT "event_id", "occurred_at", "amount"
-      FROM (SELECT * FROM table AT (VERSION => snapshot_id))
+      FROM (SELECT * FROM table AT (VERSION => snapshot_id) WHERE filename IN ('path/to/file.parquet'))
       WHERE (
       occurred_at >= TIMESTAMPTZ '2026-10-01T00:00:00Z' AND occurred_at < TIMESTAMPTZ '2026-11-01T00:00:00Z'
       )
@@ -120,8 +120,8 @@ defmodule OffBroadway.Iceberg.Producer do
   > apart, and a checkpointed job fails as incompatible when it runs again. Nothing that
   > changes on its own, such as `current_date` or `random()`, belongs in the condition.
 
-  In a distributed scan, the condition only filters the rows of each slice. Slices are
-  still made of whole data files, sized by the rows of their files before the condition
+  The condition only filters the rows of each slice. Slices are still made of whole data
+  files, sized by the rows of their files before the condition
   applies, so with a selective condition a slice can hold far fewer rows than
   `:slice_rows`, or none. The plan binds the columns and the condition once, without
   reading any rows, so that a column that does not exist, or a condition DuckDB cannot
@@ -147,9 +147,8 @@ defmodule OffBroadway.Iceberg.Producer do
 
   - `:table` - The `:table` option, as given
   - `:snapshot_id` - The snapshot the scan reads
-  - `:batch_index` - The position of the batch in the scan, or in its slice, starting
-    at 0
-  - `:slice` - With `:distribute` only, the slice the batch belongs to
+  - `:batch_index` - The position of the batch in its slice, starting at 0
+  - `:slice` - The slice the batch belongs to, starting at 0
 
   ## Backpressure
 
@@ -206,9 +205,11 @@ defmodule OffBroadway.Iceberg.Producer do
   >
   > Distributed scans are new. Their behavior may change.
 
-  With `:distribute`, the producers of this pipeline on every connected node share one
-  scan. Every producer stage is a member, so `producer: [concurrency: 2]` on three nodes
-  makes six.
+  Every scan uses the same sliced execution model. Producers of this pipeline on every
+  connected node share one scan, including multiple stages on the same node. A single
+  producer owns every slice. `producer: [concurrency: 2]` on three nodes makes six members;
+  changing either the local concurrency or the number of app instances adds members in
+  the same way.
 
   ### Slices
 
@@ -278,15 +279,16 @@ defmodule OffBroadway.Iceberg.Producer do
 
   ### Requirements
 
-  - All members must use the same pipeline name, `:table`, `:snapshot_id`, `:columns`,
-    `:where` and `:distribute`. Producers that differ in any of them scan separately. With
-    `:checkpoint`, the same `:job_id`, recorded in the same place, takes the place of
+  - Members share a scan when they use the same pipeline name, `:table`, resolved snapshot,
+    selection and slice plan. Use the same `:snapshot_id`, `:columns`, `:where` and
+    `:slice_rows` on every node. With `:checkpoint`, the same `:job_id`, recorded in the
+    same place, takes the place of
     the pipeline name. See "Checkpoints" below.
   - `:snapshot_id` must be an integer or `{:as_of, datetime}`. Members resolving
     `:current` at different times could read different snapshots.
   - The table must not have a physical column named `filename`, regardless of case: it
-    would shadow DuckDB's virtual column used to select slice files. Such tables can be
-    read without `:distribute`.
+    would shadow DuckDB's virtual column used to select slice files. Such tables are
+    rejected during planning, even when `:columns` omits that column.
 
   A member whose slice or plan fails emits `:exception`, leaves the group and stays
   idle. The other members read its slices.
@@ -306,7 +308,6 @@ defmodule OffBroadway.Iceberg.Producer do
        connection: MyApp.QuackDB,
        table: "lake.betting.events",
        snapshot_id: 123456789,
-       distribute: true,
        checkpoint: [
          job_id: "events-backfill-2026-11",
          backend:
@@ -314,8 +315,7 @@ defmodule OffBroadway.Iceberg.Producer do
             bucket: "my-checkpoints", prefix: "iceberg", auth: {:goth, MyApp.Goth}}
        ]}
 
-  `:checkpoint` requires `:distribute`, since what it records are slices. A single
-  producer on a single node is a distributed scan of one member.
+  Checkpoints work with any producer concurrency, including one producer on one node.
 
   ### Jobs
 
@@ -411,8 +411,8 @@ defmodule OffBroadway.Iceberg.Producer do
   `OffBroadway.Iceberg.Checkpoint.Error` as its `:reason`.
 
   `:name` is the Broadway pipeline name, or `nil` outside Broadway. Durations are in
-  `:native` time units. In a distributed scan, the counts of `:stop` cover every slice
-  once, wherever it was read, and those of `:exception` the batches this producer
+  `:native` time units. The counts of `:stop` cover every slice once, wherever it was
+  read, and those of `:exception` the batches this producer
   emitted. See "What `:stop` means" above.
 
   See "Completion, failure and restarts" and "What `:stop` means" above for how to
@@ -434,34 +434,20 @@ defmodule OffBroadway.Iceberg.Producer do
     producer = Keyword.fetch!(broadway_opts, :producer)
     {_producer_module, producer_opts} = Keyword.fetch!(producer, :module)
 
-    distributed? = producer_opts |> Options.validate!() |> Keyword.get(:distribute) != nil
-
-    case Keyword.get(producer, :concurrency, 1) do
-      1 ->
-        {[], broadway_opts}
-
-      _concurrency when distributed? ->
-        {[], broadway_opts}
-
-      concurrency ->
-        raise ArgumentError,
-              "#{inspect(__MODULE__)} requires producer concurrency 1 without :distribute, " <>
-                "got: #{inspect(concurrency)}. Every producer stage would scan the whole snapshot."
-    end
+    Options.validate!(producer_opts)
+    {[], broadway_opts}
   end
 
   @impl GenStage
   def init(opts) do
     name = opts |> Keyword.get(:broadway, []) |> Keyword.get(:name)
-    {distribute, scan_opts} = opts |> Options.validate!() |> Keyword.pop(:distribute)
-    {checkpoint, scan_opts} = Keyword.pop(scan_opts, :checkpoint)
+    {checkpoint, scan_opts} = opts |> Options.validate!() |> Keyword.pop(:checkpoint)
 
     state = %{
       name: name,
       table: Keyword.fetch!(scan_opts, :table),
       scan_opts: scan_opts,
       snapshot_id: nil,
-      started?: false,
       # :running -> :completed, or :failed / :cancelled.
       status: :running,
       started_at: System.monotonic_time(),
@@ -480,10 +466,9 @@ defmodule OffBroadway.Iceberg.Producer do
       emitted: 0,
       rows: 0,
       failed: 0,
-      # A scan without :distribute is a single slice that only this producer reads. A
-      # distributed one has as many slices as its plan, and joins its group once planned.
-      distributed?: distribute != nil,
-      slices: if(distribute, do: nil, else: 1),
+      # The producer joins its scan's group once its slices have been planned and any
+      # checkpoints loaded.
+      slices: nil,
       units: nil,
       plan: nil,
       planner: nil,
@@ -499,9 +484,7 @@ defmodule OffBroadway.Iceberg.Producer do
       writes: %{}
     }
 
-    state = if distribute, do: plan(state, distribute), else: state
-
-    {:producer, next_slice(state)}
+    {:producer, plan(state)}
   end
 
   @impl GenStage
@@ -510,14 +493,9 @@ defmodule OffBroadway.Iceberg.Producer do
   end
 
   @impl GenStage
-  def handle_info({Scan, ref, {:snapshot, snapshot_id}}, %{scan: %{ref: ref}} = state) do
-    {:noreply, [], start_scan(state, snapshot_id)}
-  end
-
   def handle_info({Scan, ref, {:batch, batch}}, %{scan: %{ref: ref, slice: slice}} = state) do
     read = Map.fetch!(state.reads, ref)
-    metadata = %{table: state.table, snapshot_id: state.snapshot_id, batch_index: read.emitted}
-    metadata = if state.distributed?, do: Map.put(metadata, :slice, slice), else: metadata
+    metadata = %{table: state.table, snapshot_id: state.snapshot_id, batch_index: read.emitted, slice: slice}
 
     message = %Message{
       data: batch,
@@ -637,7 +615,7 @@ defmodule OffBroadway.Iceberg.Producer do
   end
 
   # Broadway stops asking for messages and drains the ones it has, so stop fetching too.
-  # A distributed producer also leaves its group, so the others take its slices over.
+  # The producer leaves its group, so the others take its slices over.
   @impl Broadway.Producer
   # Checkpoint writes go on, so that slices whose last batches are acknowledged while
   # draining are still recorded, if the pipeline waits for them.
@@ -655,10 +633,9 @@ defmodule OffBroadway.Iceberg.Producer do
     state |> stop_planner() |> stop_loader() |> stop_scan() |> stop_writes()
   end
 
-  defp plan(state, distribute) do
+  defp plan(state) do
     ref = make_ref()
-    opts = Keyword.put(state.scan_opts, :slice_rows, Keyword.fetch!(distribute, :slice_rows))
-    {:ok, pid} = Scan.plan(self(), ref, opts)
+    {:ok, pid} = Scan.plan(self(), ref, state.scan_opts)
 
     %{state | planner: %{pid: pid, ref: ref}}
   end
@@ -774,7 +751,7 @@ defmodule OffBroadway.Iceberg.Producer do
   defp fail(state, what, reason) do
     Logger.error(
       "Scan of #{what} failed after #{state.emitted} batches and will not be " <>
-        "retried#{if state.distributed?, do: " by this producer", else: ""}: #{format_reason(reason)}"
+        "retried by this producer: #{format_reason(reason)}"
     )
 
     :telemetry.execute(
@@ -813,16 +790,11 @@ defmodule OffBroadway.Iceberg.Producer do
 
   defp next_slice(state), do: state
 
-  defp owner?(%{group: nil}, _slice), do: true
   defp owner?(state, slice), do: Distribution.owner(state.group, slice, state.members) == self()
 
   defp read_slice(state, slice) do
     ref = make_ref()
-    filter = if state.units, do: {:files, elem(state.units, slice)}
-    # A distributed scan read its snapshot when planning.
-    snapshot_id = if state.units, do: state.snapshot_id, else: state.scan_opts[:snapshot_id]
-
-    opts = Keyword.merge(state.scan_opts, snapshot_id: snapshot_id, slice: filter)
+    opts = Keyword.merge(state.scan_opts, snapshot_id: state.snapshot_id, files: elem(state.units, slice))
     read = %{slice: slice, emitted: 0, acked: 0, failed: 0, rows: 0, exhausted?: false, dropped?: false}
     {:ok, pid} = Scan.start_link(self(), ref, opts)
 
@@ -843,10 +815,8 @@ defmodule OffBroadway.Iceberg.Producer do
 
   defp request_batches(state), do: state
 
-  defp start_scan(%{started?: true} = state, _snapshot_id), do: state
-
   defp start_scan(state, snapshot_id) do
-    state = %{state | started?: true, snapshot_id: snapshot_id}
+    state = %{state | snapshot_id: snapshot_id}
     Logger.debug("Scanning #{inspect(state.table)} at snapshot #{inspect(snapshot_id)}")
 
     :telemetry.execute(

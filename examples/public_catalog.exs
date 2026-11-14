@@ -52,7 +52,10 @@ defmodule PublicCatalog.Backfill do
       producer: [
         module:
           {OffBroadway.Iceberg.Producer,
-           connection: connection, table: "pubdata." <> Keyword.fetch!(opts, :table), fetch_size: 5_000},
+           connection: connection,
+           table: "pubdata." <> Keyword.fetch!(opts, :table),
+           snapshot_id: Keyword.fetch!(opts, :snapshot_id),
+           fetch_size: 5_000},
         concurrency: 1
       ],
       processors: [
@@ -63,7 +66,10 @@ defmodule PublicCatalog.Backfill do
 
   @impl true
   def handle_message(_processor, %Message{data: batch, metadata: metadata} = message, _context) do
-    IO.puts("Batch #{metadata.batch_index}: #{batch.num_rows} rows#{strongest_earthquake(batch)}")
+    IO.puts(
+      "Slice #{metadata.slice}, batch #{metadata.batch_index}: #{batch.num_rows} rows#{strongest_earthquake(batch)}"
+    )
+
     message
   end
 
@@ -105,7 +111,11 @@ defmodule PublicCatalog do
       QuackDB.Server.child_specs(
         server: [name: PublicCatalog.DuckDB, duckdb: :managed],
         client: [name: PublicCatalog.QuackDB, pool_size: 2]
-      ) ++ [{PublicCatalog.Backfill, connection: PublicCatalog.QuackDB, table: table}]
+      ) ++
+        [
+          {PublicCatalog.Backfill,
+           connection: PublicCatalog.QuackDB, table: table, snapshot_id: {:as_of, DateTime.utc_now()}}
+        ]
 
     case Supervisor.start_link(children, strategy: :rest_for_one) do
       {:ok, supervisor} ->
