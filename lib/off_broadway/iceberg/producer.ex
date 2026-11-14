@@ -432,7 +432,7 @@ defmodule OffBroadway.Iceberg.Producer do
   end
 
   @impl Broadway.Producer
-  def prepare_for_start(_module, broadway_opts) do
+  def prepare_for_start(module, broadway_opts) do
     producer = Keyword.fetch!(broadway_opts, :producer)
     {_producer_module, producer_opts} = Keyword.fetch!(producer, :module)
     opts = Options.validate!(producer_opts)
@@ -442,7 +442,7 @@ defmodule OffBroadway.Iceberg.Producer do
         {[], broadway_opts}
 
       {managed, scan_opts} ->
-        name = Keyword.fetch!(broadway_opts, :name)
+        name = Keyword.get(broadway_opts, :name, module)
         server_opts = Keyword.fetch!(managed, :server)
         client_opts = Keyword.get(managed, :client, [])
         server_name = Keyword.get(server_opts, :name, Module.concat(name, DuckDB))
