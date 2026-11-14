@@ -11,12 +11,22 @@ defmodule OffBroadway.Iceberg.Options do
   @opts_schema [
     connection: [
       type: {:custom, __MODULE__, :validate_connection, []},
-      required: true,
       doc: """
-      The QuackDB connection pool to read through: the pid or registered name of a pool
-      started with `QuackDB.start_link/1` or `QuackDB.Server.child_specs/1`. The pool
-      belongs to your application; the producer checks out one connection at a time and
-      never stops the pool. An `Ecto.Repo` is not accepted.
+      An existing QuackDB connection pool, as a pid or registered name. Use this to
+      manage DuckDB yourself. Supply exactly one of `:connection` or `:managed`.
+      """
+    ],
+    managed: [
+      type: {:custom, __MODULE__, :validate_managed, []},
+      doc: """
+      Start a managed DuckDB server and QuackDB pool as children of the Broadway
+      topology, once per pipeline (not once per producer). Accepts
+      `[server: [...], client: [...]]`, where server options are passed to
+      `QuackDB.Server` and client options to the QuackDB pool. Names default to
+      `<Broadway name>.DuckDB` and `<Broadway name>.QuackDB`. Set a distinct
+      `:endpoint` in server options for each managed DuckDB on the same host.
+      `:init_sql` in server options assumes the proposed upstream QuackDB
+      extension; current QuackDB 0.7 does not support it yet.
       """
     ],
     table: [
@@ -110,8 +120,29 @@ defmodule OffBroadway.Iceberg.Options do
   def validate!(opts) do
     # Broadway injects :broadway (pipeline name and stage index) into the producer's options.
     {_broadway, opts} = Keyword.pop(opts, :broadway)
-    NimbleOptions.validate!(opts, @opts_schema)
+    validated = NimbleOptions.validate!(opts, @opts_schema)
+
+    case {Keyword.has_key?(validated, :connection), Keyword.has_key?(validated, :managed)} do
+      {true, false} -> validated
+      {false, true} -> validated
+      _ -> raise ArgumentError, "expected exactly one of :connection or :managed"
+    end
   end
+
+  @doc false
+  def validate_managed(opts) when is_list(opts) do
+    if Keyword.keyword?(opts) and Keyword.keys(opts) -- [:server, :client] == [] and
+         Keyword.has_key?(opts, :server) and
+         is_list(opts[:server]) and Keyword.keyword?(opts[:server]) and
+         is_list(Keyword.get(opts, :client, [])) and Keyword.keyword?(Keyword.get(opts, :client, [])) do
+      {:ok, opts}
+    else
+      {:error, "expected [server: keyword(), client: keyword()] (client is optional)"}
+    end
+  end
+
+  def validate_managed(_opts),
+    do: {:error, "expected [server: keyword(), client: keyword()] (client is optional)"}
 
   @doc false
   def validate_connection(connection)
